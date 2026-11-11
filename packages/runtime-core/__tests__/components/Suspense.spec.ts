@@ -1,0 +1,6392 @@
+/**
+ * @vitest-environment jsdom
+ */
+
+import {
+  BaseTransition,
+  type ComponentOptions,
+  Fragment,
+  KeepAlive,
+  Suspense,
+  type SuspenseProps,
+  Teleport,
+  createBlock,
+  createCommentVNode,
+  createElementBlock,
+  createElementVNode,
+  createVNode,
+  getCurrentInstance,
+  h,
+  nextTick,
+  nodeOps,
+  onActivated,
+  onBeforeMount,
+  onBeforeUnmount,
+  onDeactivated,
+  onErrorCaptured,
+  onMounted,
+  onUnmounted,
+  onUpdated,
+  openBlock,
+  ref,
+  render,
+  renderList,
+  renderSlot,
+  resolveDynamicComponent,
+  serializeInner,
+  shallowRef,
+  watch,
+  watchEffect,
+  withAsyncContext,
+  withDirectives,
+} from '@vue/runtime-test'
+import {
+  computed,
+  createApp,
+  defineAsyncComponent as defineAsyncComp,
+  defineComponent,
+  effectScope,
+  inject,
+  onScopeDispose,
+  provide,
+} from 'vue'
+import type { RawSlots } from '../../src/componentSlots'
+import { resetSuspenseId } from '../../src/components/Suspense'
+import { PatchFlags } from '@vue/shared'
+
+describe('Suspense', () => {
+  const deps: Promise<any>[] = []
+
+  beforeEach(() => {
+    deps.length = 0
+    resetSuspenseId()
+  })
+
+  // a simple async factory for testing purposes only.
+  function defineAsyncComponent<T extends ComponentOptions>(
+    comp: T,
+    delay: number = 0,
+  ) {
+    return {
+      setup(props: any, { slots }: any) {
+        const p = new Promise(resolve => {
+          setTimeout(() => {
+            resolve(() => h(comp, props, slots))
+          }, delay)
+        })
+        // in Node 12, due to timer/nextTick mechanism change, we have to wait
+        // an extra tick to avoid race conditions
+        deps.push(p.then(() => Promise.resolve()))
+        return p
+      },
+    }
+  }
+
+  const RouterView = {
+    setup(_: any, { slots }: any) {
+      const route = inject('route') as any
+      const depth = inject('depth', 0)
+      provide('depth', depth + 1)
+      return () => {
+        const current = route.value[depth]
+        return slots.default({ Component: current })[0]
+      }
+    },
+  }
+
+  test('fallback content', async () => {
+    const Async = defineAsyncComponent({
+      render() {
+        return h('div', 'async')
+      },
+    })
+
+    const Comp = {
+      setup() {
+        return () =>
+          h(Suspense, null, {
+            default: h(Async),
+            fallback: h('div', 'fallback'),
+          })
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>async</div>`)
+  })
+
+  test('emits events', async () => {
+    const Async = defineAsyncComponent({
+      render() {
+        return h('div', 'async')
+      },
+    })
+
+    const onFallback = vi.fn()
+    const onResolve = vi.fn()
+    const onPending = vi.fn()
+
+    const show = ref(true)
+    const Comp = {
+      setup() {
+        return () =>
+          h(
+            Suspense,
+            {
+              onFallback,
+              onResolve,
+              onPending,
+              // force displaying the fallback right away
+              timeout: 0,
+            },
+            {
+              default: () => (show.value ? h(Async) : null),
+              fallback: h('div', 'fallback'),
+            },
+          )
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(onFallback).toHaveBeenCalledTimes(1)
+    expect(onPending).toHaveBeenCalledTimes(1)
+    expect(onResolve).toHaveBeenCalledTimes(0)
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(onFallback).toHaveBeenCalledTimes(1)
+    expect(onPending).toHaveBeenCalledTimes(1)
+    expect(onResolve).toHaveBeenCalledTimes(1)
+
+    show.value = false
+    await nextTick()
+    expect(onFallback).toHaveBeenCalledTimes(1)
+    expect(onPending).toHaveBeenCalledTimes(2)
+    expect(onResolve).toHaveBeenCalledTimes(2)
+
+    deps.length = 0
+    show.value = true
+    await nextTick()
+    expect(onFallback).toHaveBeenCalledTimes(2)
+    expect(onPending).toHaveBeenCalledTimes(3)
+    expect(onResolve).toHaveBeenCalledTimes(2)
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(onFallback).toHaveBeenCalledTimes(2)
+    expect(onPending).toHaveBeenCalledTimes(3)
+    expect(onResolve).toHaveBeenCalledTimes(3)
+  })
+
+  test('nested async deps', async () => {
+    const calls: string[] = []
+
+    const AsyncOuter = defineAsyncComponent({
+      setup() {
+        onMounted(() => {
+          calls.push('outer mounted')
+        })
+        return () => h(AsyncInner)
+      },
+    })
+
+    const AsyncInner = defineAsyncComponent(
+      {
+        setup() {
+          onMounted(() => {
+            calls.push('inner mounted')
+          })
+          return () => h('div', 'inner')
+        },
+      },
+      10,
+    )
+
+    const Comp = {
+      setup() {
+        return () =>
+          h(Suspense, null, {
+            default: h(AsyncOuter),
+            fallback: h('div', 'fallback'),
+          })
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+    expect(calls).toEqual([])
+
+    await deps[0]
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+    expect(calls).toEqual([])
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(calls).toEqual([`outer mounted`, `inner mounted`])
+    expect(serializeInner(root)).toBe(`<div>inner</div>`)
+  })
+
+  test('onResolve', async () => {
+    const Async = defineAsyncComponent({
+      render() {
+        return h('div', 'async')
+      },
+    })
+
+    const onResolve = vi.fn()
+
+    const Comp = {
+      setup() {
+        return () =>
+          h(
+            Suspense,
+            {
+              onResolve,
+            },
+            {
+              default: h(Async),
+              fallback: h('div', 'fallback'),
+            },
+          )
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+    expect(onResolve).not.toHaveBeenCalled()
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>async</div>`)
+    expect(onResolve).toHaveBeenCalled()
+  })
+
+  test('buffer mounted/updated hooks & post flush watch callbacks', async () => {
+    const deps: Promise<any>[] = []
+    const calls: string[] = []
+    const toggle = ref(true)
+
+    const Async = {
+      async setup() {
+        const p = new Promise(r => setTimeout(r, 1))
+        // extra tick needed for Node 12+
+        deps.push(p.then(() => Promise.resolve()))
+
+        watchEffect(
+          () => {
+            calls.push('watch effect')
+          },
+          { flush: 'post' },
+        )
+
+        const count = ref(0)
+        watch(
+          count,
+          () => {
+            calls.push('watch callback')
+          },
+          { flush: 'post' },
+        )
+        count.value++ // trigger the watcher now
+
+        onMounted(() => {
+          calls.push('mounted')
+        })
+
+        onUnmounted(() => {
+          calls.push('unmounted')
+        })
+
+        await p
+        return () => h('div', 'async')
+      },
+    }
+
+    const Comp = {
+      setup() {
+        return () =>
+          h(Suspense, null, {
+            default: toggle.value ? h(Async) : null,
+            fallback: h('div', 'fallback'),
+          })
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+    expect(calls).toEqual([])
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>async</div>`)
+    expect(calls).toEqual([`watch effect`, `watch callback`, `mounted`])
+
+    // effects inside an already resolved suspense should happen at normal timing
+    toggle.value = false
+    await nextTick()
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<!---->`)
+    expect(calls).toEqual([
+      `watch effect`,
+      `watch callback`,
+      `mounted`,
+      'unmounted',
+    ])
+  })
+
+  // #1059
+  test('mounted/updated hooks & fallback component', async () => {
+    const deps: Promise<any>[] = []
+    const calls: string[] = []
+    const toggle = ref(true)
+
+    const Async = {
+      async setup() {
+        const p = new Promise(r => setTimeout(r, 1))
+        // extra tick needed for Node 12+
+        deps.push(p.then(() => Promise.resolve()))
+
+        await p
+        return () => h('div', 'async')
+      },
+    }
+
+    const Fallback = {
+      setup() {
+        onMounted(() => {
+          calls.push('mounted')
+        })
+
+        onUnmounted(() => {
+          calls.push('unmounted')
+        })
+        return () => h('div', 'fallback')
+      },
+    }
+
+    const Comp = {
+      setup() {
+        return () =>
+          h(Suspense, null, {
+            default: toggle.value ? h(Async) : null,
+            fallback: h(Fallback),
+          })
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+    expect(calls).toEqual([`mounted`])
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>async</div>`)
+    expect(calls).toEqual([`mounted`, `unmounted`])
+  })
+
+  test('content update before suspense resolve', async () => {
+    const Async = defineAsyncComponent({
+      props: { msg: String },
+      setup(props: any) {
+        return () => h('div', props.msg)
+      },
+    })
+
+    const msg = ref('foo')
+
+    const Comp = {
+      setup() {
+        return () =>
+          h(Suspense, null, {
+            default: h(Async, { msg: msg.value }),
+            fallback: h('div', `fallback ${msg.value}`),
+          })
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe(`<div>fallback foo</div>`)
+
+    // value changed before resolve
+    msg.value = 'bar'
+    await nextTick()
+    // fallback content should be updated
+    expect(serializeInner(root)).toBe(`<div>fallback bar</div>`)
+
+    await Promise.all(deps)
+    await nextTick()
+    // async component should receive updated props/slots when resolved
+    expect(serializeInner(root)).toBe(`<div>bar</div>`)
+  })
+
+  // mount/unmount hooks should not even fire
+  test('unmount before suspense resolve', async () => {
+    const deps: Promise<any>[] = []
+    const calls: string[] = []
+    const toggle = ref(true)
+
+    const Async = {
+      async setup() {
+        const p = new Promise(r => setTimeout(r, 1))
+        deps.push(p)
+
+        watchEffect(
+          () => {
+            calls.push('watch effect')
+          },
+          { flush: 'post' },
+        )
+
+        const count = ref(0)
+        watch(
+          count,
+          () => {
+            calls.push('watch callback')
+          },
+          { flush: 'post' },
+        )
+        count.value++ // trigger the watcher now
+
+        onMounted(() => {
+          calls.push('mounted')
+        })
+
+        onUnmounted(() => {
+          calls.push('unmounted')
+        })
+
+        await p
+        return () => h('div', 'async')
+      },
+    }
+
+    const Comp = {
+      setup() {
+        return () =>
+          h(Suspense, null, {
+            default: toggle.value ? h(Async) : null,
+            fallback: h('div', 'fallback'),
+          })
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+    expect(calls).toEqual([])
+
+    // remove the async dep before it's resolved
+    toggle.value = false
+    await nextTick()
+    // should cause the suspense to resolve immediately
+    expect(serializeInner(root)).toBe(`<!---->`)
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<!---->`)
+    // should discard effects
+    expect(calls).toEqual([])
+  })
+
+  test('unmount suspense after resolve', async () => {
+    const toggle = ref(true)
+    const unmounted = vi.fn()
+
+    const Async = defineAsyncComponent({
+      setup() {
+        onUnmounted(unmounted)
+        return () => h('div', 'async')
+      },
+    })
+
+    const Comp = {
+      setup() {
+        return () =>
+          toggle.value
+            ? h(Suspense, null, {
+                default: h(Async),
+                fallback: h('div', 'fallback'),
+              })
+            : null
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>async</div>`)
+    expect(unmounted).not.toHaveBeenCalled()
+
+    toggle.value = false
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<!---->`)
+    expect(unmounted).toHaveBeenCalled()
+  })
+
+  test('unmount suspense before resolve', async () => {
+    const toggle = ref(true)
+    const mounted = vi.fn()
+    const unmounted = vi.fn()
+
+    const Async = defineAsyncComponent({
+      setup() {
+        onMounted(mounted)
+        onUnmounted(unmounted)
+        return () => h('div', 'async')
+      },
+    })
+
+    const Comp = {
+      setup() {
+        return () =>
+          toggle.value
+            ? h(Suspense, null, {
+                default: h(Async),
+                fallback: h('div', 'fallback'),
+              })
+            : null
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+
+    toggle.value = false
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<!---->`)
+    expect(mounted).not.toHaveBeenCalled()
+    expect(unmounted).not.toHaveBeenCalled()
+
+    await Promise.all(deps)
+    await nextTick()
+    // should not resolve and cause unmount
+    expect(mounted).not.toHaveBeenCalled()
+    expect(unmounted).not.toHaveBeenCalled()
+  })
+
+  test('unmount suspense before resolve: no unmounted hook for a component still in setup', async () => {
+    const log: string[] = []
+    let resolveSetup!: () => void
+
+    const Slow = {
+      async setup() {
+        onBeforeMount(() => log.push('bm'))
+        onMounted(() => log.push('m'))
+        onBeforeUnmount(() => log.push('bum'))
+        onUnmounted(() => log.push('um'))
+        await new Promise<void>(r => (resolveSetup = r))
+        return () => h('div', 'slow')
+      },
+    }
+
+    const toggle = ref(true)
+    const root = nodeOps.createElement('div')
+    render(
+      h(() =>
+        toggle.value
+          ? h(Suspense, null, {
+              default: h(Slow),
+              fallback: h('div', 'fallback'),
+            })
+          : null,
+      ),
+      root,
+    )
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+
+    toggle.value = false
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<!---->`)
+    expect(log).toEqual(['bum'])
+
+    resolveSetup()
+    await new Promise(r => setTimeout(r))
+    expect(log).toEqual(['bum'])
+  })
+
+  test('unmount suspense before resolve: no unmounted hook for a built but unrevealed component', async () => {
+    const log: string[] = []
+    const Slow = defineAsyncComponent({ render: () => h('div', 'slow') })
+    const Sync = {
+      setup() {
+        onBeforeMount(() => log.push('bm'))
+        onMounted(() => log.push('m'))
+        onBeforeUnmount(() => log.push('bum'))
+        onUnmounted(() => log.push('um'))
+        return () => h('div', 'sync')
+      },
+    }
+
+    const toggle = ref(true)
+    const root = nodeOps.createElement('div')
+    render(
+      h(() =>
+        toggle.value
+          ? h(Suspense, null, {
+              default: h('div', [h(Slow), h(Sync)]),
+              fallback: h('div', 'fallback'),
+            })
+          : null,
+      ),
+      root,
+    )
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+    expect(log).toEqual(['bm'])
+
+    toggle.value = false
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<!---->`)
+    expect(log).toEqual(['bm', 'bum'])
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(log).toEqual(['bm', 'bum'])
+  })
+
+  // coverage guard: the instance is still marked unmounted once its unmount
+  // hooks are discarded
+  test('unmount suspense before resolve: emit from a component still in setup is dropped', async () => {
+    const onLoaded = vi.fn()
+    let resolveSetup!: () => void
+
+    const Slow = {
+      emits: ['loaded'],
+      async setup(_: any, { emit }: any) {
+        await new Promise<void>(r => (resolveSetup = r))
+        emit('loaded')
+        return () => h('div', 'slow')
+      },
+    }
+
+    const toggle = ref(true)
+    const root = nodeOps.createElement('div')
+    render(
+      h(() =>
+        toggle.value
+          ? h(Suspense, null, {
+              default: h(Slow, { onLoaded }),
+              fallback: h('div', 'fallback'),
+            })
+          : null,
+      ),
+      root,
+    )
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+
+    toggle.value = false
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<!---->`)
+
+    resolveSetup()
+    await new Promise(r => setTimeout(r))
+    expect(onLoaded).not.toHaveBeenCalled()
+  })
+
+  test('discard before resolve: emit from a component still in setup is dropped', async () => {
+    const onLoaded = vi.fn()
+    let resolveSetup!: () => void
+
+    const Slow = {
+      emits: ['loaded'],
+      async setup(_: any, { emit }: any) {
+        await new Promise<void>(r => (resolveSetup = r))
+        emit('loaded')
+        return () => h('div', 'slow')
+      },
+    }
+
+    const toggle = ref(true)
+    const root = nodeOps.createElement('div')
+    render(
+      h(() =>
+        h(Suspense, null, {
+          default: toggle.value ? h(Slow, { onLoaded }) : h('div', 'other'),
+          fallback: h('div', 'fallback'),
+        }),
+      ),
+      root,
+    )
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+
+    toggle.value = false
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>other</div>`)
+
+    resolveSetup()
+    await new Promise(r => setTimeout(r))
+    expect(onLoaded).not.toHaveBeenCalled()
+  })
+
+  // coverage guard: the shown fallback was mounted, so it is unmounted as usual
+  test('unmount suspense before resolve: unmounted hook of the shown component fallback', async () => {
+    const unmounted = vi.fn()
+    const Slow = defineAsyncComponent({ render: () => h('div', 'slow') })
+    const Fallback = {
+      setup() {
+        onUnmounted(unmounted)
+        return () => h('div', 'fallback')
+      },
+    }
+
+    const toggle = ref(true)
+    const root = nodeOps.createElement('div')
+    render(
+      h(() =>
+        toggle.value
+          ? h(Suspense, null, {
+              default: h(Slow),
+              fallback: h(Fallback),
+            })
+          : null,
+      ),
+      root,
+    )
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+
+    toggle.value = false
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<!---->`)
+    expect(unmounted).toHaveBeenCalledTimes(1)
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(unmounted).toHaveBeenCalledTimes(1)
+  })
+
+  // coverage guard: a deferred unmounted hook still runs before the instance
+  // is marked unmounted when the boundary resolves under a pending ancestor
+  test('deferred unmounted hook under a pending ancestor can still emit', async () => {
+    const cleanup = vi.fn()
+    let resolveInner!: () => void
+    let resolveOuter!: () => void
+
+    const Child = {
+      emits: ['cleanup'],
+      setup(_: any, { emit }: any) {
+        onUnmounted(() => emit('cleanup'))
+        return () => h('div', 'child')
+      },
+    }
+    const InnerSlow = {
+      async setup() {
+        await new Promise<void>(r => (resolveInner = r))
+        return () => h('div', 'inner')
+      },
+    }
+    const OuterSlow = {
+      async setup() {
+        await new Promise<void>(r => (resolveOuter = r))
+        return () => h('div', 'outer')
+      },
+    }
+    const show = ref(true)
+    const Inner = {
+      render: () =>
+        h(Suspense, null, {
+          default: h('div', [
+            show.value ? h(Child, { onCleanup: cleanup }) : null,
+            h(InnerSlow),
+          ]),
+        }),
+    }
+
+    const root = nodeOps.createElement('div')
+    render(
+      h(() =>
+        h(Suspense, null, {
+          default: h('div', [h(Inner), h(OuterSlow)]),
+          fallback: h('div', 'loading'),
+        }),
+      ),
+      root,
+    )
+    expect(serializeInner(root)).toBe(`<div>loading</div>`)
+
+    // Child is removed inside the pending inner branch
+    show.value = false
+    await nextTick()
+    resolveInner()
+    await new Promise(r => setTimeout(r))
+    expect(serializeInner(root)).toBe(`<div>loading</div>`)
+    expect(cleanup).not.toHaveBeenCalled()
+
+    resolveOuter()
+    await new Promise(r => setTimeout(r))
+    expect(serializeInner(root)).toBe(
+      `<div><div><!----><div>inner</div></div><div>outer</div></div>`,
+    )
+    expect(cleanup).toHaveBeenCalledTimes(1)
+  })
+
+  test.each([
+    ['unmount suspense before resolve', true],
+    ['discard before resolve', false],
+  ])(
+    '%s: keep-alive hooks of a discarded component are deregistered',
+    async (_, unmountBoundary) => {
+      const activated = vi.fn()
+      const deactivated = vi.fn()
+      const Slow = defineAsyncComponent({ render: () => h('div', 'slow') })
+      const Sync = {
+        setup() {
+          onActivated(activated)
+          onDeactivated(deactivated)
+          return () => h('div', 'sync')
+        },
+      }
+      const show = ref(false)
+      const pending = () => h('div', [h(Slow), h(Sync)])
+      const Page = {
+        name: 'Page',
+        render: () =>
+          h('div', [
+            unmountBoundary
+              ? show.value
+                ? h(Suspense, null, { default: pending() })
+                : null
+              : h(Suspense, null, {
+                  default: show.value ? pending() : h('span', 'page'),
+                }),
+          ]),
+      }
+      const idle = unmountBoundary
+        ? `<div><!----></div>`
+        : `<div><span>page</span></div>`
+      const Other = { name: 'Other', render: () => h('div', 'other') }
+      const view = shallowRef<ComponentOptions>(Page)
+      const root = nodeOps.createElement('div')
+      render(
+        h(() => h(KeepAlive, null, { default: () => h(view.value) })),
+        root,
+      )
+      expect(serializeInner(root)).toBe(idle)
+
+      // Sync is built in the pending branch, then dropped with it
+      show.value = true
+      await nextTick()
+      show.value = false
+      await nextTick()
+      expect(serializeInner(root)).toBe(idle)
+      await Promise.all(deps)
+      await nextTick()
+
+      view.value = Other
+      await nextTick()
+      view.value = Page
+      await nextTick()
+      expect(serializeInner(root)).toBe(idle)
+      expect(deactivated).not.toHaveBeenCalled()
+      expect(activated).not.toHaveBeenCalled()
+    },
+  )
+
+  test.each([
+    ['unmount suspense before resolve', true],
+    ['discard before resolve', false],
+  ])(
+    '%s: timers of a discarded non-suspensible async component are cleared',
+    async (_, unmountBoundary) => {
+      vi.useFakeTimers()
+      try {
+        let resolveSlow!: () => void
+        const Slow = {
+          async setup() {
+            await new Promise<void>(r => (resolveSlow = r))
+            return () => h('div', 'slow')
+          },
+        }
+        const Wrapper = defineAsyncComp({
+          loader: () => new Promise(() => {}),
+          suspensible: false,
+          delay: 200,
+          timeout: 1000,
+        })
+        const show = ref(true)
+        const pending = () => h('div', [h(Slow), h(Wrapper)])
+        const root = nodeOps.createElement('div')
+        render(
+          h(() =>
+            unmountBoundary
+              ? show.value
+                ? h(Suspense, null, { default: pending() })
+                : null
+              : h(Suspense, null, {
+                  default: show.value ? pending() : h('span', 'other'),
+                }),
+          ),
+          root,
+        )
+        expect(vi.getTimerCount()).toBe(2)
+
+        show.value = false
+        await nextTick()
+        expect(vi.getTimerCount()).toBe(0)
+        void resolveSlow
+      } finally {
+        vi.useRealTimers()
+      }
+    },
+  )
+
+  // vuetifyjs/vuetify#15207
+  test('update prop of async element before suspense resolve', async () => {
+    let resolve: () => void
+    const mounted = new Promise<void>(r => {
+      resolve = r
+    })
+    const Async = {
+      async setup() {
+        onMounted(() => {
+          resolve()
+        })
+        const p = new Promise(r => setTimeout(r, 1))
+        await p
+        return () => h('div', 'async')
+      },
+    }
+
+    const Comp: ComponentOptions<{ data: string }> = {
+      props: ['data'],
+      setup(props) {
+        return () => h(Async, { 'data-test': props.data })
+      },
+    }
+
+    const Root = {
+      setup() {
+        const data = ref('1')
+        onMounted(() => {
+          data.value = '2'
+        })
+        return () =>
+          h(Suspense, null, {
+            default: h(Comp, { data: data.value }),
+            fallback: h('div', 'fallback'),
+          })
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Root), root)
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+    await mounted
+    expect(serializeInner(root)).toBe(`<div data-test="2">async</div>`)
+  })
+
+  test('nested suspense (parent resolves first)', async () => {
+    const calls: string[] = []
+
+    const AsyncOuter = defineAsyncComponent(
+      {
+        setup: () => {
+          onMounted(() => {
+            calls.push('outer mounted')
+          })
+          return () => h('div', 'async outer')
+        },
+      },
+      1,
+    )
+
+    const AsyncInner = defineAsyncComponent(
+      {
+        setup: () => {
+          onMounted(() => {
+            calls.push('inner mounted')
+          })
+          return () => h('div', 'async inner')
+        },
+      },
+      10,
+    )
+
+    const Inner = {
+      setup() {
+        return () =>
+          h(Suspense, null, {
+            default: h(AsyncInner),
+            fallback: h('div', 'fallback inner'),
+          })
+      },
+    }
+
+    const Comp = {
+      setup() {
+        return () =>
+          h(Suspense, null, {
+            default: h('div', [h(AsyncOuter), h(Inner)]),
+            fallback: h('div', 'fallback outer'),
+          })
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe(`<div>fallback outer</div>`)
+
+    await deps[0]
+    await nextTick()
+    expect(serializeInner(root)).toBe(
+      `<div><div>async outer</div><div>fallback inner</div></div>`,
+    )
+    expect(calls).toEqual([`outer mounted`])
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe(
+      `<div><div>async outer</div><div>async inner</div></div>`,
+    )
+    expect(calls).toEqual([`outer mounted`, `inner mounted`])
+  })
+
+  test('nested suspense (child resolves first)', async () => {
+    const calls: string[] = []
+
+    const AsyncOuter = defineAsyncComponent(
+      {
+        setup: () => {
+          onMounted(() => {
+            calls.push('outer mounted')
+          })
+          return () => h('div', 'async outer')
+        },
+      },
+      10,
+    )
+
+    const AsyncInner = defineAsyncComponent(
+      {
+        setup: () => {
+          onMounted(() => {
+            calls.push('inner mounted')
+          })
+          return () => h('div', 'async inner')
+        },
+      },
+      1,
+    )
+
+    const Inner = {
+      setup() {
+        return () =>
+          h(Suspense, null, {
+            default: h(AsyncInner),
+            fallback: h('div', 'fallback inner'),
+          })
+      },
+    }
+
+    const Comp = {
+      setup() {
+        return () =>
+          h(Suspense, null, {
+            default: h('div', [h(AsyncOuter), h(Inner)]),
+            fallback: h('div', 'fallback outer'),
+          })
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe(`<div>fallback outer</div>`)
+
+    await deps[1]
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>fallback outer</div>`)
+    expect(calls).toEqual([])
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe(
+      `<div><div>async outer</div><div>async inner</div></div>`,
+    )
+    expect(calls).toEqual([`inner mounted`, `outer mounted`])
+  })
+
+  test('error handling', async () => {
+    const Async = {
+      async setup() {
+        throw new Error('oops')
+      },
+    }
+
+    const Comp = {
+      setup() {
+        const errorMessage = ref<string | null>(null)
+        onErrorCaptured(err => {
+          errorMessage.value =
+            err instanceof Error
+              ? err.message
+              : `A non-Error value thrown: ${err}`
+          return false
+        })
+
+        return () =>
+          errorMessage.value
+            ? h('div', errorMessage.value)
+            : h(Suspense, null, {
+                default: h(Async),
+                fallback: h('div', 'fallback'),
+              })
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>oops</div>`)
+  })
+
+  // #3857
+  test('error handling w/ template optimization', async () => {
+    const Async = {
+      async setup() {
+        throw new Error('oops')
+      },
+    }
+
+    const Comp = {
+      template: `
+      <div v-if="errorMessage">{{ errorMessage }}</div>
+      <Suspense v-else>
+        <div>
+          <Async />
+        </div>
+        <template #fallback>
+          <div>fallback</div>
+        </template>
+      </Suspense>
+      `,
+      components: { Async },
+      setup() {
+        const errorMessage = ref<string | null>(null)
+        onErrorCaptured(err => {
+          errorMessage.value =
+            err instanceof Error
+              ? err.message
+              : `A non-Error value thrown: ${err}`
+          return false
+        })
+        return { errorMessage }
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>oops</div>`)
+  })
+
+  it('combined usage (nested async + nested suspense + multiple deps)', async () => {
+    const msg = ref('nested msg')
+    const calls: number[] = []
+
+    const AsyncChildWithSuspense = defineAsyncComponent({
+      props: { msg: String },
+      setup(props: any) {
+        onMounted(() => {
+          calls.push(0)
+        })
+        return () =>
+          h(Suspense, null, {
+            default: h(AsyncInsideNestedSuspense, { msg: props.msg }),
+            fallback: h('div', 'nested fallback'),
+          })
+      },
+    })
+
+    const AsyncInsideNestedSuspense = defineAsyncComponent(
+      {
+        props: { msg: String },
+        setup(props: any) {
+          onMounted(() => {
+            calls.push(2)
+          })
+          return () => h('div', props.msg)
+        },
+      },
+      20,
+    )
+
+    const AsyncChildParent = defineAsyncComponent({
+      props: { msg: String },
+      setup(props: any) {
+        onMounted(() => {
+          calls.push(1)
+        })
+        return () => h(NestedAsyncChild, { msg: props.msg })
+      },
+    })
+
+    const NestedAsyncChild = defineAsyncComponent(
+      {
+        props: { msg: String },
+        setup(props: any) {
+          onMounted(() => {
+            calls.push(3)
+          })
+          return () => h('div', props.msg)
+        },
+      },
+      10,
+    )
+
+    const MiddleComponent = {
+      setup() {
+        return () =>
+          h(AsyncChildWithSuspense, {
+            msg: msg.value,
+          })
+      },
+    }
+
+    const Comp = {
+      setup() {
+        return () =>
+          h(Suspense, null, {
+            default: h('div', [
+              h(MiddleComponent),
+              h(AsyncChildParent, {
+                msg: 'root async',
+              }),
+            ]),
+            fallback: h('div', 'root fallback'),
+          })
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe(`<div>root fallback</div>`)
+    expect(calls).toEqual([])
+
+    /**
+     * <Root>
+     *   <Suspense>
+     *     <MiddleComponent>
+     *       <AsyncChildWithSuspense> (0: resolves on macrotask)
+     *         <Suspense>
+     *           <AsyncInsideNestedSuspense> (2: resolves on macrotask + 20ms)
+     *     <AsyncChildParent> (1: resolves on macrotask)
+     *       <NestedAsyncChild> (3: resolves on macrotask + 10ms)
+     */
+
+    // both top level async deps resolved, but there is another nested dep
+    // so should still be in fallback state
+    await Promise.all([deps[0], deps[1]])
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>root fallback</div>`)
+    expect(calls).toEqual([])
+
+    // root suspense all deps resolved. should show root content now
+    // with nested suspense showing fallback content
+    await deps[3]
+    await nextTick()
+    expect(serializeInner(root)).toBe(
+      `<div><div>nested fallback</div><div>root async</div></div>`,
+    )
+    expect(calls).toEqual([0, 1, 3])
+
+    // change state for the nested component before it resolves
+    msg.value = 'nested changed'
+
+    // all deps resolved, nested suspense should resolve now
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe(
+      `<div><div>nested changed</div><div>root async</div></div>`,
+    )
+    expect(calls).toEqual([0, 1, 3, 2])
+
+    // should update just fine after resolve
+    msg.value = 'nested changed again'
+    await nextTick()
+    expect(serializeInner(root)).toBe(
+      `<div><div>nested changed again</div><div>root async</div></div>`,
+    )
+  })
+
+  test('switching branches', async () => {
+    const calls: string[] = []
+    const toggle = ref(true)
+
+    const Foo = defineAsyncComponent({
+      setup() {
+        onMounted(() => {
+          calls.push('foo mounted')
+        })
+        onUnmounted(() => {
+          calls.push('foo unmounted')
+        })
+        return () => h('div', ['foo', h(FooNested)])
+      },
+    })
+
+    const FooNested = defineAsyncComponent(
+      {
+        setup() {
+          onMounted(() => {
+            calls.push('foo nested mounted')
+          })
+          onUnmounted(() => {
+            calls.push('foo nested unmounted')
+          })
+          return () => h('div', 'foo nested')
+        },
+      },
+      10,
+    )
+
+    const Bar = defineAsyncComponent(
+      {
+        setup() {
+          onMounted(() => {
+            calls.push('bar mounted')
+          })
+          onUnmounted(() => {
+            calls.push('bar unmounted')
+          })
+          return () => h('div', 'bar')
+        },
+      },
+      10,
+    )
+
+    const Comp = {
+      setup() {
+        return () =>
+          h(Suspense, null, {
+            default: toggle.value ? h(Foo) : h(Bar),
+            fallback: h('div', 'fallback'),
+          })
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+    expect(calls).toEqual([])
+
+    await deps[0]
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+    expect(calls).toEqual([])
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(calls).toEqual([`foo mounted`, `foo nested mounted`])
+    expect(serializeInner(root)).toBe(`<div>foo<div>foo nested</div></div>`)
+
+    // toggle
+    toggle.value = false
+    await nextTick()
+    expect(deps.length).toBe(3)
+    // should remain on current view
+    expect(calls).toEqual([`foo mounted`, `foo nested mounted`])
+    expect(serializeInner(root)).toBe(`<div>foo<div>foo nested</div></div>`)
+
+    await Promise.all(deps)
+    await nextTick()
+    const tempCalls = [
+      `foo mounted`,
+      `foo nested mounted`,
+      `bar mounted`,
+      `foo nested unmounted`,
+      `foo unmounted`,
+    ]
+    expect(calls).toEqual(tempCalls)
+    expect(serializeInner(root)).toBe(`<div>bar</div>`)
+
+    // toggle back
+    toggle.value = true
+    await nextTick()
+    // should remain
+    expect(calls).toEqual(tempCalls)
+    expect(serializeInner(root)).toBe(`<div>bar</div>`)
+
+    await deps[3]
+    await nextTick()
+    // still pending...
+    expect(calls).toEqual(tempCalls)
+    expect(serializeInner(root)).toBe(`<div>bar</div>`)
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(calls).toEqual([
+      ...tempCalls,
+      `foo mounted`,
+      `foo nested mounted`,
+      `bar unmounted`,
+    ])
+    expect(serializeInner(root)).toBe(`<div>foo<div>foo nested</div></div>`)
+  })
+
+  // #10098
+  test('switching branches w/ nested suspense', async () => {
+    const OuterB = defineAsyncComponent({
+      setup: () => {
+        return () =>
+          h(RouterView, null, {
+            default: ({ Component }: any) => [
+              h(Suspense, null, {
+                default: () => h(Component),
+              }),
+            ],
+          })
+      },
+    })
+
+    const InnerB = defineAsyncComponent({
+      setup: () => {
+        return () => h('div', 'innerB')
+      },
+    })
+
+    const OuterA = defineAsyncComponent({
+      setup: () => {
+        return () =>
+          h(RouterView, null, {
+            default: ({ Component }: any) => [
+              h(Suspense, null, {
+                default: () => h(Component),
+              }),
+            ],
+          })
+      },
+    })
+
+    const InnerA = defineAsyncComponent({
+      setup: () => {
+        return () => h('div', 'innerA')
+      },
+    })
+
+    const toggle = ref(true)
+    const route = computed(() => {
+      return toggle.value ? [OuterA, InnerA] : [OuterB, InnerB]
+    })
+
+    const Comp = {
+      setup() {
+        provide('route', route)
+        return () =>
+          h(RouterView, null, {
+            default: ({ Component }: any) => [
+              h(Suspense, null, {
+                default: () => h(Component),
+              }),
+            ],
+          })
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<!---->`)
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>innerA</div>`)
+
+    deps.length = 0
+
+    toggle.value = false
+    await nextTick()
+    // toggle again
+    toggle.value = true
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>innerA</div>`)
+  })
+
+  // #10415
+  test('nested suspense (w/ suspensible) switch several times before parent suspense resolve', async () => {
+    const OuterA = defineAsyncComponent({
+      setup: () => {
+        return () =>
+          h(RouterView, null, {
+            default: ({ Component }: any) => [
+              h(Suspense, null, {
+                default: () => h(Component),
+              }),
+            ],
+          })
+      },
+    })
+
+    const InnerA = defineAsyncComponent({
+      setup: () => {
+        return () => h('div', 'innerA')
+      },
+    })
+
+    const route = shallowRef([OuterA, InnerA])
+    const InnerB = defineAsyncComponent(
+      {
+        setup: () => {
+          return () => h('div', 'innerB')
+        },
+      },
+      5,
+    )
+
+    const InnerB1 = defineAsyncComponent(
+      {
+        setup: () => {
+          return () => h('div', 'innerB1')
+        },
+      },
+      5,
+    )
+
+    const InnerB2 = defineAsyncComponent(
+      {
+        setup: () => {
+          return () => h('div', 'innerB2')
+        },
+      },
+      5,
+    )
+
+    const OuterB = defineAsyncComponent(
+      {
+        setup() {
+          nextTick(async () => {
+            await new Promise(resolve => setTimeout(resolve, 1))
+            route.value = [OuterB, InnerB1]
+          })
+
+          nextTick(async () => {
+            await new Promise(resolve => setTimeout(resolve, 1))
+            route.value = [OuterB, InnerB2]
+          })
+
+          return () =>
+            h(RouterView, null, {
+              default: ({ Component }: any) => [
+                h(
+                  Suspense,
+                  { suspensible: true },
+                  {
+                    default: () => h(Component),
+                  },
+                ),
+              ],
+            })
+        },
+      },
+      5,
+    )
+
+    const Comp = {
+      setup() {
+        provide('route', route)
+        return () =>
+          h(RouterView, null, {
+            default: ({ Component }: any) => [
+              h(Suspense, null, {
+                default: () => h(Component),
+              }),
+            ],
+          })
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<!---->`)
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>innerA</div>`)
+
+    deps.length = 0
+
+    route.value = [OuterB, InnerB]
+    await nextTick()
+
+    await Promise.all(deps)
+    await Promise.all(deps)
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>innerB2</div>`)
+  })
+
+  test('branch switch to 3rd branch before resolve', async () => {
+    const calls: string[] = []
+
+    const makeComp = (name: string, delay = 0) =>
+      defineAsyncComponent(
+        {
+          setup() {
+            onMounted(() => {
+              calls.push(`${name} mounted`)
+            })
+            onUnmounted(() => {
+              calls.push(`${name} unmounted`)
+            })
+            return () => h('div', [name])
+          },
+        },
+        delay,
+      )
+
+    const One = makeComp('one')
+    const Two = makeComp('two', 10)
+    const Three = makeComp('three', 20)
+
+    const view = shallowRef(One)
+
+    const Comp = {
+      setup() {
+        return () =>
+          h(Suspense, null, {
+            default: h(view.value),
+            fallback: h('div', 'fallback'),
+          })
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+    expect(calls).toEqual([])
+
+    await deps[0]
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>one</div>`)
+    expect(calls).toEqual([`one mounted`])
+
+    view.value = Two
+    await nextTick()
+    expect(deps.length).toBe(2)
+
+    // switch before two resolves
+    view.value = Three
+    await nextTick()
+    expect(deps.length).toBe(3)
+
+    // dep for two resolves
+    await deps[1]
+    await nextTick()
+    // should still be on view one
+    expect(serializeInner(root)).toBe(`<div>one</div>`)
+    expect(calls).toEqual([`one mounted`])
+
+    await deps[2]
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>three</div>`)
+    expect(calls).toEqual([`one mounted`, `three mounted`, `one unmounted`])
+  })
+
+  test('branch switch back before resolve', async () => {
+    const calls: string[] = []
+
+    const makeComp = (name: string, delay = 0) =>
+      defineAsyncComponent(
+        {
+          setup() {
+            onMounted(() => {
+              calls.push(`${name} mounted`)
+            })
+            onUnmounted(() => {
+              calls.push(`${name} unmounted`)
+            })
+            return () => h('div', [name])
+          },
+        },
+        delay,
+      )
+
+    const One = makeComp('one')
+    const Two = makeComp('two', 10)
+
+    const view = shallowRef(One)
+
+    const Comp = {
+      setup() {
+        return () =>
+          h(Suspense, null, {
+            default: h(view.value),
+            fallback: h('div', 'fallback'),
+          })
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+    expect(calls).toEqual([])
+
+    await deps[0]
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>one</div>`)
+    expect(calls).toEqual([`one mounted`])
+
+    view.value = Two
+    await nextTick()
+    expect(deps.length).toBe(2)
+
+    // switch back before two resolves
+    view.value = One
+    await nextTick()
+    expect(deps.length).toBe(2)
+
+    // dep for two resolves
+    await deps[1]
+    await nextTick()
+    // should still be on view one
+    expect(serializeInner(root)).toBe(`<div>one</div>`)
+    expect(calls).toEqual([`one mounted`])
+  })
+
+  test('branch switch timeout + fallback', async () => {
+    const calls: string[] = []
+
+    const makeComp = (name: string, delay = 0) =>
+      defineAsyncComponent(
+        {
+          setup() {
+            onMounted(() => {
+              calls.push(`${name} mounted`)
+            })
+            onUnmounted(() => {
+              calls.push(`${name} unmounted`)
+            })
+            return () => h('div', [name])
+          },
+        },
+        delay,
+      )
+
+    const One = makeComp('one')
+    const Two = makeComp('two', 20)
+
+    const view = shallowRef(One)
+
+    const Comp = {
+      setup() {
+        return () =>
+          h(
+            Suspense,
+            {
+              timeout: 10,
+            },
+            {
+              default: h(view.value),
+              fallback: h('div', 'fallback'),
+            },
+          )
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+    expect(calls).toEqual([])
+
+    await deps[0]
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>one</div>`)
+    expect(calls).toEqual([`one mounted`])
+
+    view.value = Two
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>one</div>`)
+    expect(calls).toEqual([`one mounted`])
+
+    await new Promise(r => setTimeout(r, 10))
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+    expect(calls).toEqual([`one mounted`, `one unmounted`])
+
+    await deps[1]
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>two</div>`)
+    expect(calls).toEqual([`one mounted`, `one unmounted`, `two mounted`])
+  })
+
+  test('mount the fallback content is in the correct position', async () => {
+    const makeComp = (name: string, delay = 0) =>
+      defineAsyncComponent(
+        {
+          setup() {
+            return () => h('div', [name])
+          },
+        },
+        delay,
+      )
+
+    const One = makeComp('one')
+    const Two = makeComp('two', 20)
+
+    const view = shallowRef(One)
+
+    const Comp = {
+      setup() {
+        return () =>
+          h('div', [
+            h(
+              Suspense,
+              {
+                timeout: 10,
+              },
+              {
+                default: h(view.value),
+                fallback: h('div', 'fallback'),
+              },
+            ),
+            h('div', 'three'),
+          ])
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe(
+      `<div><div>fallback</div><div>three</div></div>`,
+    )
+
+    await deps[0]
+    await nextTick()
+    expect(serializeInner(root)).toBe(
+      `<div><div>one</div><div>three</div></div>`,
+    )
+
+    view.value = Two
+    await nextTick()
+    expect(serializeInner(root)).toBe(
+      `<div><div>one</div><div>three</div></div>`,
+    )
+
+    await new Promise(r => setTimeout(r, 10))
+    await nextTick()
+    expect(serializeInner(root)).toBe(
+      `<div><div>fallback</div><div>three</div></div>`,
+    )
+
+    await deps[1]
+    await nextTick()
+    expect(serializeInner(root)).toBe(
+      `<div><div>two</div><div>three</div></div>`,
+    )
+  })
+
+  // #2214
+  // Since suspense renders its own root like a component, it should not patch
+  // its content in optimized mode.
+  test('should not miss nested element updates when used in templates', async () => {
+    const n = ref(1)
+    const Comp = {
+      setup() {
+        return { n }
+      },
+      template: `
+      <Suspense>
+        <div><span>{{ n }}</span></div>
+      </Suspense>
+      `,
+    }
+    const root = document.createElement('div')
+    createApp(Comp).mount(root)
+    expect(root.innerHTML).toBe(`<div><span>1</span></div>`)
+
+    n.value++
+    await nextTick()
+    expect(root.innerHTML).toBe(`<div><span>2</span></div>`)
+  })
+
+  // #2215
+  test('toggling nested async setup component inside already resolved suspense', async () => {
+    const toggle = ref(false)
+    const Child = {
+      async setup() {
+        return () => h('div', 'child')
+      },
+    }
+    const Parent = () => h('div', ['parent', toggle.value ? h(Child) : null])
+    const Comp = {
+      setup() {
+        return () => h(Suspense, () => h(Parent))
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe(`<div>parent<!----></div>`)
+
+    toggle.value = true
+    // wait for flush
+    await nextTick()
+    // wait for child async setup resolve
+    await nextTick()
+    // child should be rendered now instead of stuck in limbo
+    expect(serializeInner(root)).toBe(`<div>parent<div>child</div></div>`)
+
+    toggle.value = false
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>parent<!----></div>`)
+  })
+
+  test('warn if using async setup when not in a Suspense boundary', () => {
+    const Child = {
+      name: 'Child',
+      async setup() {
+        return () => h('div', 'child')
+      },
+    }
+    const Parent = {
+      setup() {
+        return () => h('div', [h(Child)])
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Parent), root)
+
+    expect(
+      `A component with async setup() must be nested in a <Suspense>`,
+    ).toHaveBeenWarned()
+  })
+
+  test('nested suspense with suspensible', async () => {
+    const calls: string[] = []
+    let expected = ''
+
+    const InnerA = defineAsyncComponent(
+      {
+        setup: () => {
+          calls.push('innerA created')
+          onMounted(() => {
+            calls.push('innerA mounted')
+          })
+          return () => h('div', 'innerA')
+        },
+      },
+      10,
+    )
+
+    const InnerB = defineAsyncComponent(
+      {
+        setup: () => {
+          calls.push('innerB created')
+          onMounted(() => {
+            calls.push('innerB mounted')
+          })
+          return () => h('div', 'innerB')
+        },
+      },
+      10,
+    )
+
+    const OuterA = defineAsyncComponent(
+      {
+        setup: (_, { slots }: any) => {
+          calls.push('outerA created')
+          onMounted(() => {
+            calls.push('outerA mounted')
+          })
+          return () =>
+            h(Fragment, null, [h('div', 'outerA'), slots.default?.()])
+        },
+      },
+      5,
+    )
+
+    const OuterB = defineAsyncComponent(
+      {
+        setup: (_, { slots }: any) => {
+          calls.push('outerB created')
+          onMounted(() => {
+            calls.push('outerB mounted')
+          })
+          return () =>
+            h(Fragment, null, [h('div', 'outerB'), slots.default?.()])
+        },
+      },
+      5,
+    )
+
+    const outerToggle = ref(false)
+    const innerToggle = ref(false)
+
+    /**
+     *  <Suspense>
+     *    <component :is="outerToggle ? outerB : outerA">
+     *      <Suspense suspensible>
+     *        <component :is="innerToggle ? innerB : innerA" />
+     *      </Suspense>
+     *    </component>
+     *  </Suspense>
+     */
+    const Comp = {
+      setup() {
+        return () =>
+          h(Suspense, null, {
+            default: [
+              h(outerToggle.value ? OuterB : OuterA, null, {
+                default: () =>
+                  h(
+                    Suspense,
+                    { suspensible: true },
+                    {
+                      default: h(innerToggle.value ? InnerB : InnerA),
+                    },
+                  ),
+              }),
+            ],
+            fallback: h('div', 'fallback outer'),
+          })
+      },
+    }
+
+    expected = `<div>fallback outer</div>`
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe(expected)
+
+    // mount outer component
+    await Promise.all(deps)
+    await nextTick()
+
+    expect(serializeInner(root)).toBe(expected)
+    expect(calls).toEqual([`outerA created`])
+
+    // mount inner component
+    await Promise.all(deps)
+    await nextTick()
+    expected = `<div>outerA</div><div>innerA</div>`
+    expect(serializeInner(root)).toBe(expected)
+
+    expect(calls).toEqual([
+      'outerA created',
+      'innerA created',
+      'outerA mounted',
+      'innerA mounted',
+    ])
+
+    // toggle outer component
+    calls.length = 0
+    deps.length = 0
+    outerToggle.value = true
+    await nextTick()
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe(expected) // expect not change
+
+    await Promise.all(deps)
+    await nextTick()
+    expected = `<div>outerB</div><div>innerA</div>`
+    expect(serializeInner(root)).toBe(expected)
+    expect(calls).toContain('outerB mounted')
+    expect(calls).toContain('innerA mounted')
+
+    // toggle inner component
+    calls.length = 0
+    deps.length = 0
+    innerToggle.value = true
+    await nextTick()
+    expect(serializeInner(root)).toBe(expected) // expect not change
+
+    await Promise.all(deps)
+    await nextTick()
+    expected = `<div>outerB</div><div>innerB</div>`
+    expect(serializeInner(root)).toBe(expected)
+    expect(calls).toContain('innerB mounted')
+  })
+
+  test('unmounting a pending nested suspensible suspense should resolve its parent', async () => {
+    const Inner = defineAsyncComponent(
+      {
+        setup: () => () => h('div', 'inner'),
+      },
+      10,
+    )
+
+    const show = ref(true)
+
+    /**
+     *  <Suspense>
+     *    <div>
+     *      <Suspense suspensible v-if="show"><Inner /></Suspense>
+     *      <span>other</span>
+     *    </div>
+     *  </Suspense>
+     */
+    const Comp = {
+      setup() {
+        return () =>
+          h(Suspense, null, {
+            default: h('div', [
+              show.value
+                ? h(Suspense, { suspensible: true }, { default: h(Inner) })
+                : createCommentVNode('v-if', true),
+              h('span', 'other'),
+            ]),
+            fallback: h('div', 'fallback'),
+          })
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+
+    show.value = false
+    await nextTick()
+    expect(serializeInner(root)).toBe(
+      `<div><!--v-if--><span>other</span></div>`,
+    )
+
+    await Promise.all(deps)
+  })
+
+  test('replacing a pending nested suspensible suspense with an async component', async () => {
+    const Inner = defineAsyncComponent(
+      {
+        setup: () => () => h('div', 'inner'),
+      },
+      20,
+    )
+    const Other = defineAsyncComponent(
+      {
+        setup: () => () => h('div', 'other'),
+      },
+      10,
+    )
+
+    const show = ref(true)
+
+    /**
+     *  <Suspense>
+     *    <Wrapper>
+     *      <div>
+     *        <Suspense suspensible v-if="show"><Inner /></Suspense>
+     *        <Other v-else />
+     *      </div>
+     *    </Wrapper>
+     *  </Suspense>
+     */
+    const Wrapper = {
+      setup() {
+        return () =>
+          h('div', [
+            show.value
+              ? h(Suspense, { suspensible: true }, { default: h(Inner) })
+              : h(Other),
+          ])
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(
+      h(Suspense, null, {
+        default: h(Wrapper),
+        fallback: h('div', 'fallback'),
+      }),
+      root,
+    )
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+
+    show.value = false
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div><div>other</div></div>`)
+  })
+
+  test('discarded nested suspensible suspense should not release a stale parent dep', async () => {
+    const Inner = defineAsyncComponent(
+      {
+        setup: () => () => h('div', 'inner'),
+      },
+      10,
+    )
+    const Other = defineAsyncComponent(
+      {
+        setup: () => () => h('div', 'other'),
+      },
+      10,
+    )
+
+    const toggle = ref(true)
+
+    /**
+     *  <Suspense>
+     *    <div v-if="toggle"><Suspense suspensible><Inner /></Suspense></div>
+     *    <span v-else><Other /></span>
+     *  </Suspense>
+     */
+    const Comp = {
+      setup() {
+        return () =>
+          h(Suspense, null, {
+            default: toggle.value
+              ? h('div', [
+                  h(Suspense, { suspensible: true }, { default: h(Inner) }),
+                ])
+              : h('span', [h(Other)]),
+            fallback: h('div', 'fallback'),
+          })
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+
+    toggle.value = false
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+
+    toggle.value = true
+    await nextTick()
+    render(null, root)
+    await nextTick()
+    expect(
+      'suspense.resolve() is called on an already unmounted suspense boundary',
+    ).not.toHaveBeenWarned()
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe(``)
+  })
+
+  // #8206
+  test('nested suspense with suspensible & no async deps', async () => {
+    const calls: string[] = []
+    let expected = ''
+
+    const InnerA = defineComponent({
+      setup: () => {
+        calls.push('innerA created')
+        onMounted(() => {
+          calls.push('innerA mounted')
+        })
+        return () => h('div', 'innerA')
+      },
+    })
+
+    const InnerB = defineComponent({
+      setup: () => {
+        calls.push('innerB created')
+        onMounted(() => {
+          calls.push('innerB mounted')
+        })
+        return () => h('div', 'innerB')
+      },
+    })
+
+    const OuterA = defineComponent({
+      setup: (_, { slots }: any) => {
+        calls.push('outerA created')
+        onMounted(() => {
+          calls.push('outerA mounted')
+        })
+        return () => h(Fragment, null, [h('div', 'outerA'), slots.default?.()])
+      },
+    })
+
+    const OuterB = defineComponent({
+      setup: (_, { slots }: any) => {
+        calls.push('outerB created')
+        onMounted(() => {
+          calls.push('outerB mounted')
+        })
+        return () => h(Fragment, null, [h('div', 'outerB'), slots.default?.()])
+      },
+    })
+
+    const outerToggle = ref(false)
+    const innerToggle = ref(false)
+
+    /**
+     *  <Suspense>
+     *    <component :is="outerToggle ? outerB : outerA">
+     *      <Suspense suspensible>
+     *        <component :is="innerToggle ? innerB : innerA" />
+     *      </Suspense>
+     *    </component>
+     *  </Suspense>
+     */
+    const Comp = defineComponent({
+      setup() {
+        return () =>
+          h(Suspense, null, {
+            default: [
+              h(outerToggle.value ? OuterB : OuterA, null, {
+                default: () =>
+                  h(
+                    Suspense,
+                    { suspensible: true },
+                    {
+                      default: h(innerToggle.value ? InnerB : InnerA),
+                    },
+                  ),
+              }),
+            ],
+            fallback: h('div', 'fallback outer'),
+          })
+      },
+    })
+
+    expected = `<div>outerA</div><div>innerA</div>`
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe(expected)
+
+    // mount outer component and inner component
+    await Promise.all(deps)
+    await nextTick()
+
+    expect(serializeInner(root)).toBe(expected)
+    expect(calls).toEqual([
+      'outerA created',
+      'innerA created',
+      'innerA mounted',
+      'outerA mounted',
+    ])
+
+    // toggle outer component
+    calls.length = 0
+    deps.length = 0
+    outerToggle.value = true
+    await nextTick()
+
+    await Promise.all(deps)
+    await nextTick()
+    expected = `<div>outerB</div><div>innerA</div>`
+    expect(serializeInner(root)).toBe(expected)
+    expect(calls).toContain('outerB mounted')
+    expect(calls).toContain('innerA mounted')
+
+    // toggle inner component
+    calls.length = 0
+    deps.length = 0
+    innerToggle.value = true
+    await Promise.all(deps)
+    await nextTick()
+    expected = `<div>outerB</div><div>innerB</div>`
+    expect(serializeInner(root)).toBe(expected)
+  })
+
+  //#8678
+  test('nested suspense (child suspense update before parent suspense resolve)', async () => {
+    const calls: string[] = []
+
+    const InnerA = defineAsyncComponent(
+      {
+        setup: () => {
+          calls.push('innerA created')
+          onMounted(() => {
+            calls.push('innerA mounted')
+          })
+          return () => h('div', 'innerA')
+        },
+      },
+      10,
+    )
+
+    const InnerB = defineAsyncComponent(
+      {
+        setup: () => {
+          calls.push('innerB created')
+          onMounted(() => {
+            calls.push('innerB mounted')
+          })
+          return () => h('div', 'innerB')
+        },
+      },
+      10,
+    )
+
+    const OuterA = defineAsyncComponent(
+      {
+        setup: (_, { slots }: any) => {
+          calls.push('outerA created')
+          onMounted(() => {
+            calls.push('outerA mounted')
+          })
+          return () =>
+            h(Fragment, null, [h('div', 'outerA'), slots.default?.()])
+        },
+      },
+      5,
+    )
+
+    const OuterB = defineAsyncComponent(
+      {
+        setup: (_, { slots }: any) => {
+          calls.push('outerB created')
+          onMounted(() => {
+            calls.push('outerB mounted')
+          })
+          return () =>
+            h(Fragment, null, [h('div', 'outerB'), slots.default?.()])
+        },
+      },
+      5,
+    )
+
+    const outerToggle = ref(false)
+    const innerToggle = ref(false)
+
+    /**
+     *  <Suspense>
+     *    <component :is="outerToggle ? outerB : outerA">
+     *      <Suspense>
+     *        <component :is="innerToggle ? innerB : innerA" />
+     *      </Suspense>
+     *    </component>
+     *  </Suspense>
+     */
+    const Comp = {
+      setup() {
+        return () =>
+          h(Suspense, null, {
+            default: [
+              h(outerToggle.value ? OuterB : OuterA, null, {
+                default: () =>
+                  h(Suspense, null, {
+                    default: h(innerToggle.value ? InnerB : InnerA),
+                  }),
+              }),
+            ],
+            fallback: h('div', 'fallback outer'),
+          })
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe(`<div>fallback outer</div>`)
+
+    // mount outer component
+    await Promise.all(deps)
+    await nextTick()
+
+    expect(serializeInner(root)).toBe(`<div>outerA</div><!---->`)
+    expect(calls).toEqual([`outerA created`, `outerA mounted`])
+
+    // mount inner component
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>outerA</div><div>innerA</div>`)
+
+    expect(calls).toEqual([
+      'outerA created',
+      'outerA mounted',
+      'innerA created',
+      'innerA mounted',
+    ])
+
+    calls.length = 0
+    deps.length = 0
+
+    // toggle both outer and inner components
+    outerToggle.value = true
+    innerToggle.value = true
+    await nextTick()
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>outerB</div><!---->`)
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>outerB</div><div>innerB</div>`)
+
+    // innerB only mount once
+    expect(calls).toEqual([
+      'outerB created',
+      'outerB mounted',
+      'innerB created',
+      'innerB mounted',
+    ])
+  })
+
+  // toggling a nested suspensible suspense to sync content resolves the
+  // parent boundary synchronously while it is still being patched; the
+  // fallback fall-through must then be skipped or it patches the unmounted
+  // fallback and corrupts activeBranch
+  test('nested suspensible suspense toggled to sync content while parent is in fallback', async () => {
+    const route = ref('a')
+    const label = ref('first')
+
+    const AsyncChild = {
+      async setup() {
+        await new Promise(() => {}) // never resolves
+        return () => h('div', 'async child')
+      },
+    }
+    const PageA = {
+      setup: () => () => h('div', [h('span', 'page a'), h(AsyncChild)]),
+    }
+    const PageB = {
+      setup: () => () => h('div', `page b ${label.value}`),
+    }
+
+    const Comp = {
+      setup() {
+        return () =>
+          h(Suspense, null, {
+            default: h('div', { 'data-label': label.value }, [
+              h(
+                Suspense,
+                { suspensible: true },
+                {
+                  default:
+                    route.value === 'a'
+                      ? h(PageA, { key: 'a' })
+                      : h(PageB, { key: 'b' }),
+                },
+              ),
+            ]),
+            fallback: h('div', 'fallback'),
+          })
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+
+    // the nested suspense resolves synchronously, propagates, and resolves
+    // the outer boundary mid-patch
+    route.value = 'b'
+    await nextTick()
+    expect(serializeInner(root)).toBe(
+      `<div data-label="first"><div>page b first</div></div>`,
+    )
+
+    // a follow-up update must still reach the DOM
+    label.value = 'second'
+    await nextTick()
+    expect(serializeInner(root)).toBe(
+      `<div data-label="second"><div>page b second</div></div>`,
+    )
+  })
+
+  // a nested suspensible suspense resolving synchronously inside the parent's
+  // same-root patch must not resolve the parent before later siblings in the
+  // same patch have registered their async deps
+  test('nested suspensible suspense resolving the parent mid-patch while a later sibling registers an async dep', async () => {
+    const route = ref('a')
+    const show = ref(false)
+    let releaseSibling: () => void
+    const siblingGate = new Promise<void>(r => (releaseSibling = r))
+
+    const NeverChild = {
+      async setup() {
+        await new Promise(() => {}) // never resolves
+        return () => h('div', 'never')
+      },
+    }
+    const Sibling = {
+      async setup() {
+        await siblingGate
+        return () => h('div', 'sibling')
+      },
+    }
+    const PageA = {
+      setup: () => () => h('div', [h('span', 'page a'), h(NeverChild)]),
+    }
+    const PageB = {
+      setup: () => () => h('div', 'page b'),
+    }
+
+    const onResolve = vi.fn()
+    const Comp = {
+      setup() {
+        return () =>
+          h(
+            Suspense,
+            { onResolve },
+            {
+              default: h('div', [
+                h(
+                  Suspense,
+                  { suspensible: true },
+                  {
+                    default:
+                      route.value === 'a'
+                        ? h(PageA, { key: 'a' })
+                        : h(PageB, { key: 'b' }),
+                  },
+                ),
+                show.value ? h(Sibling) : null,
+              ]),
+              fallback: h('div', 'fallback'),
+            },
+          )
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+
+    // the nested suspense resolves synchronously and releases the parent's
+    // last dep, but the sibling mounted right after it is still pending
+    route.value = 'b'
+    show.value = true
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+    expect(onResolve).not.toHaveBeenCalled()
+
+    releaseSibling!()
+    await new Promise(r => setTimeout(r))
+    expect(serializeInner(root)).toBe(
+      `<div><div>page b</div><div>sibling</div></div>`,
+    )
+    expect(onResolve).toHaveBeenCalledTimes(1)
+  })
+
+  // #6416
+  test('KeepAlive with Suspense', async () => {
+    const Async = defineAsyncComponent({
+      render() {
+        return h('div', 'async')
+      },
+    })
+    const Sync = {
+      render() {
+        return h('div', 'sync')
+      },
+    }
+    const components = [Async, Sync]
+    const viewRef = ref(0)
+    const root = nodeOps.createElement('div')
+    const App = {
+      render() {
+        return h(KeepAlive, null, {
+          default: () => {
+            return h(Suspense, null, {
+              default: h(components[viewRef.value]),
+              fallback: h('div', 'Loading-dynamic-components'),
+            })
+          },
+        })
+      },
+    }
+    render(h(App), root)
+    expect(serializeInner(root)).toBe(`<div>Loading-dynamic-components</div>`)
+
+    viewRef.value = 1
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>sync</div>`)
+
+    viewRef.value = 0
+    await nextTick()
+
+    expect(serializeInner(root)).toBe('<div>sync</div>')
+
+    await Promise.all(deps)
+    await nextTick()
+    // when async resolve,it should be <div>async</div>
+    expect(serializeInner(root)).toBe('<div>async</div>')
+
+    viewRef.value = 1
+    await nextTick()
+    // TypeError: Cannot read properties of null (reading 'parentNode')
+    // This has been fixed
+    expect(serializeInner(root)).toBe(`<div>sync</div>`)
+  })
+
+  // #10899 / #11427
+  test('KeepAlive + Suspense switch before branch resolves', async () => {
+    const Async1 = defineAsyncComponent({
+      render() {
+        return h('div', 'async1')
+      },
+    })
+    const Async2 = defineAsyncComponent({
+      render() {
+        return h('div', 'async2')
+      },
+    })
+    const components = [Async1, Async2]
+    const viewRef = ref(0)
+    const root = nodeOps.createElement('div')
+    const App = {
+      render() {
+        return h(
+          KeepAlive,
+          {
+            max: 1,
+          },
+          {
+            default: () => {
+              return h(Suspense, null, {
+                default: h(components[viewRef.value]),
+                fallback: h('div', 'loading'),
+              })
+            },
+          },
+        )
+      },
+    }
+    render(h(App), root)
+    expect(serializeInner(root)).toBe(`<div>loading</div>`)
+
+    // switch to Async2 before Async1 resolves
+    viewRef.value = 1
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>loading</div>`)
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe('<div>async2</div>')
+
+    viewRef.value = 0
+    await nextTick()
+    await Promise.all(deps)
+    expect(serializeInner(root)).toBe(`<div>async1</div>`)
+
+    viewRef.value = 1
+    await nextTick()
+    await Promise.all(deps)
+    expect(serializeInner(root)).toBe(`<div>async2</div>`)
+  })
+
+  // #15288
+  test('KeepAlive + Suspense switch while ancestor is pending', async () => {
+    let resolveRootDep!: (comp: ComponentOptions) => void
+    const rootDep = new Promise<ComponentOptions>(resolve => {
+      resolveRootDep = resolve
+    })
+    const RootDep = defineAsyncComp(() => rootDep)
+    const makePage = (name: string) =>
+      defineAsyncComponent({
+        render: () => h('div', `page ${name}`),
+      })
+    const PageA = makePage('A')
+    const PageB = makePage('B')
+    const page = shallowRef(PageA)
+    const key = ref('a')
+    const root = nodeOps.createElement('div')
+    const App = {
+      render() {
+        return h(Suspense, null, {
+          default: h('div', [
+            h(RootDep),
+            h(KeepAlive, null, {
+              default: () =>
+                h(Suspense, null, {
+                  default: h(page.value, { key: key.value }),
+                }),
+            }),
+          ]),
+          fallback: h('div', 'loading'),
+        })
+      },
+    }
+
+    render(h(App), root)
+    expect(serializeInner(root)).toBe('<div>loading</div>')
+
+    await Promise.all(deps)
+    await nextTick()
+
+    page.value = PageB
+    key.value = 'b'
+    await nextTick()
+    expect(serializeInner(root)).toBe('<div>loading</div>')
+
+    resolveRootDep({
+      render: () => h('div', 'root'),
+    })
+    await rootDep
+    await new Promise(r => setTimeout(r))
+    await nextTick()
+    expect(serializeInner(root)).toBe(
+      '<div><div>root</div><div>page A</div></div>',
+    )
+
+    page.value = PageA
+    key.value = 'a'
+    await nextTick()
+    expect(serializeInner(root)).toBe(
+      '<div><div>root</div><div>page A</div></div>',
+    )
+
+    page.value = PageB
+    key.value = 'b'
+    await nextTick()
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe(
+      '<div><div>root</div><div>page B</div></div>',
+    )
+  })
+
+  test('KeepAlive + Suspense + comment slot', async () => {
+    const toggle = ref(false)
+    const Async = defineAsyncComponent({
+      render() {
+        return h('div', 'async1')
+      },
+    })
+    const App = {
+      render() {
+        return h(KeepAlive, null, {
+          default: () => {
+            return h(Suspense, null, {
+              default: toggle.value ? h(Async) : createCommentVNode('v-if'),
+            })
+          },
+        })
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(App), root)
+    expect(serializeInner(root)).toBe(`<!--v-if-->`)
+
+    toggle.value = true
+    await nextTick()
+    await Promise.all(deps)
+    expect(serializeInner(root)).toBe(`<div>async1</div>`)
+  })
+
+  // #15976
+  test('async dep in a kept-alive branch resolves while the branch is inactive', async () => {
+    let resolveChild!: (comp: ComponentOptions) => void
+    const AsyncChild = defineAsyncComp(
+      () => new Promise<ComponentOptions>(r => (resolveChild = r)),
+    )
+    const route = ref('page')
+    const revision = ref(0)
+    const show = ref(false)
+    // the async child is Page's root, so updating Page while it is unresolved
+    // goes through the renderer's async-root retry
+    const Page = {
+      render: () =>
+        show.value ? h(AsyncChild, { revision: revision.value }) : null,
+    }
+    const Entry = {
+      name: 'Entry',
+      render: () => h('div', [h(Page)]),
+    }
+    const Other = { render: () => h('div', 'other') }
+    const root = nodeOps.createElement('div')
+    const App = {
+      render: () =>
+        h(
+          KeepAlive,
+          { include: 'Entry' },
+          {
+            default: () =>
+              h(Suspense, null, {
+                default: h(route.value === 'page' ? Entry : Other),
+                fallback: h('div', 'loading'),
+              }),
+          },
+        ),
+    }
+    render(h(App), root)
+    expect(serializeInner(root)).toBe('<div><!----></div>')
+
+    // registers with the boundary after it has resolved
+    show.value = true
+    await nextTick()
+    expect(serializeInner(root)).toBe('<div><!----></div>')
+
+    route.value = 'other'
+    await nextTick()
+    expect(serializeInner(root)).toBe('<div>other</div>')
+
+    resolveChild({
+      props: ['revision'],
+      setup: (props: any) => () => h('span', `child ${props.revision}`),
+    })
+    await new Promise(r => setTimeout(r))
+
+    route.value = 'page'
+    revision.value++
+    await nextTick()
+    expect(serializeInner(root)).toBe('<div><span>child 1</span></div>')
+  })
+
+  test('async dep in the active branch resolves after a discarded toggle', async () => {
+    let resolveChild!: (comp: ComponentOptions) => void
+    const AsyncChild = defineAsyncComp(
+      () => new Promise<ComponentOptions>(r => (resolveChild = r)),
+    )
+    const show = ref(false)
+    const PageA = {
+      render: () => h('div', [show.value ? h(AsyncChild) : null]),
+    }
+    const PageB = defineAsyncComponent({ render: () => h('div', 'b') })
+    const view = shallowRef<ComponentOptions>(PageA)
+    const root = nodeOps.createElement('div')
+    const App = {
+      render: () =>
+        h(Suspense, null, {
+          default: h(view.value),
+          fallback: h('div', 'loading'),
+        }),
+    }
+    render(h(App), root)
+    expect(serializeInner(root)).toBe('<div><!----></div>')
+
+    show.value = true
+    await nextTick()
+    expect(serializeInner(root)).toBe('<div><!----></div>')
+
+    // PageA stays active while PageB is pending
+    view.value = PageB
+    await nextTick()
+    expect(serializeInner(root)).toBe('<div><!----></div>')
+
+    // toggled back: PageB is discarded, PageA is resumed
+    view.value = PageA
+    await nextTick()
+    expect(serializeInner(root)).toBe('<div><!----></div>')
+
+    resolveChild({ render: () => h('span', 'child') })
+    await new Promise(r => setTimeout(r))
+    expect(serializeInner(root)).toBe('<div><span>child</span></div>')
+  })
+
+  test.each([
+    ['while the branch is inactive', true],
+    ['after the branch is re-entered', false],
+  ])(
+    'pending dep of a re-entered kept-alive branch resolves %s',
+    async (_, resolveWhileInactive) => {
+      const AsyncChild = defineAsyncComponent({
+        render: () => h('div', 'async'),
+      })
+      const Entry = {
+        name: 'Entry',
+        props: ['show'],
+        render(this: any) {
+          return h('div', [this.show ? h(AsyncChild) : null])
+        },
+      }
+      const Other = { render: () => h('div', 'other') }
+      const Third = defineAsyncComponent({ render: () => h('div', 'third') })
+      const route = ref('page')
+      const show = ref(false)
+      const root = nodeOps.createElement('div')
+      const App = {
+        render: () =>
+          h(KeepAlive, null, {
+            default: () =>
+              h(Suspense, null, {
+                default:
+                  route.value === 'page'
+                    ? h(Entry, { show: show.value })
+                    : route.value === 'other'
+                      ? h(Other)
+                      : h(Third),
+                fallback: h('div', 'loading'),
+              }),
+          }),
+      }
+      render(h(App), root)
+      // KeepAlive caches a Suspense child once the boundary has resolved
+      await nextTick()
+      expect(serializeInner(root)).toBe('<div><!----></div>')
+
+      route.value = 'other'
+      await nextTick()
+      expect(serializeInner(root)).toBe('<div>other</div>')
+
+      // re-entering with a new prop mounts the async child inside the pending
+      // patch, so it is counted as a dep of that pending cycle
+      route.value = 'page'
+      show.value = true
+      await nextTick()
+      expect(serializeInner(root)).toBe('<div>other</div>')
+
+      // toggled away before it resolves: the cycle is discarded, the cached
+      // branch keeps the pending child
+      route.value = 'other'
+      await nextTick()
+      expect(serializeInner(root)).toBe('<div>other</div>')
+
+      if (resolveWhileInactive) {
+        await Promise.all(deps)
+        await nextTick()
+        expect(serializeInner(root)).toBe('<div>other</div>')
+      }
+
+      route.value = 'page'
+      await nextTick()
+      if (!resolveWhileInactive) {
+        expect(serializeInner(root)).toBe('<div><!----></div>')
+        await Promise.all(deps)
+        await nextTick()
+      }
+      expect(serializeInner(root)).toBe('<div><div>async</div></div>')
+
+      // the discarded cycle must not have been counted down: the next async
+      // branch is still waited for
+      route.value = 'third'
+      await nextTick()
+      expect(serializeInner(root)).toBe('<div><div>async</div></div>')
+
+      await Promise.all(deps)
+      await nextTick()
+      expect(serializeInner(root)).toBe('<div>third</div>')
+    },
+  )
+
+  test('off-cycle async dep must not add its own async children to the pending cycle', async () => {
+    let resolveChild!: (comp: ComponentOptions) => void
+    const AsyncChild = defineAsyncComp(
+      () => new Promise<ComponentOptions>(r => (resolveChild = r)),
+    )
+    // never loads
+    const Stuck = defineAsyncComp(() => new Promise<ComponentOptions>(() => {}))
+    const show = ref(false)
+    const PageA = {
+      render: () => h('div', [show.value ? h(AsyncChild) : null]),
+    }
+    const PageB = defineAsyncComponent({ render: () => h('div', 'b') })
+    const view = shallowRef<ComponentOptions>(PageA)
+    const root = nodeOps.createElement('div')
+    const App = {
+      render: () =>
+        h(Suspense, null, {
+          default: h(view.value),
+          fallback: h('div', 'loading'),
+        }),
+    }
+    render(h(App), root)
+    show.value = true
+    await nextTick()
+    expect(serializeInner(root)).toBe('<div><!----></div>')
+
+    view.value = PageB
+    await nextTick()
+    expect(serializeInner(root)).toBe('<div><!----></div>')
+
+    // finishes while PageB is pending; its render mounts a stuck async child
+    resolveChild({ render: () => h(Stuck) })
+    await new Promise(r => setTimeout(r))
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe('<div>b</div>')
+  })
+
+  test('recovery render of a kept-alive dep does not wait for a pending ancestor boundary', async () => {
+    let resolveChild!: (comp: ComponentOptions) => void
+    const AsyncChild = defineAsyncComp(
+      () => new Promise<ComponentOptions>(r => (resolveChild = r)),
+    )
+    let resolveGate!: (comp: ComponentOptions) => void
+    const InnerGate = defineAsyncComp(
+      () => new Promise<ComponentOptions>(r => (resolveGate = r)),
+    )
+    // never resolves: the outer boundary stays pending on it
+    const OuterPage = defineAsyncComp(
+      () => new Promise<ComponentOptions>(() => {}),
+    )
+    const route = ref('page')
+    const revision = ref(0)
+    const show = ref(false)
+    const gate = ref(false)
+    const outer = ref('layout')
+    const Page = {
+      render: () =>
+        show.value ? h(AsyncChild, { revision: revision.value }) : null,
+    }
+    const Entry = {
+      name: 'Entry',
+      props: ['gate'],
+      render(this: any) {
+        return h('div', [h(Page), this.gate ? h(InnerGate) : null])
+      },
+    }
+    const Other = { render: () => h('div', 'other') }
+    const Layout = {
+      render: () =>
+        h('div', [
+          h(
+            KeepAlive,
+            { include: 'Entry' },
+            {
+              default: () =>
+                h(Suspense, null, {
+                  default:
+                    route.value === 'page'
+                      ? h(Entry, { gate: gate.value })
+                      : h(Other),
+                  fallback: h('div', 'inner loading'),
+                }),
+            },
+          ),
+        ]),
+    }
+    const root = nodeOps.createElement('div')
+    const App = {
+      render: () =>
+        h(Suspense, null, {
+          default: outer.value === 'layout' ? h(Layout) : h(OuterPage),
+          fallback: h('div', 'outer loading'),
+        }),
+    }
+    render(h(App), root)
+    await nextTick()
+    expect(serializeInner(root)).toBe('<div><div><!----><!----></div></div>')
+
+    show.value = true
+    await nextTick()
+
+    // re-entering with a gate makes the inner boundary pending again
+    route.value = 'other'
+    await nextTick()
+    route.value = 'page'
+    gate.value = true
+    await nextTick()
+    expect(serializeInner(root)).toBe('<div><div>other</div></div>')
+
+    // the outer boundary starts pending on a branch that never settles
+    outer.value = 'other'
+    await nextTick()
+
+    // settles while the inner boundary is pending: parked there
+    resolveChild({
+      props: ['revision'],
+      setup: (props: any) => () => h('span', `child ${props.revision}`),
+    })
+    await new Promise(r => setTimeout(r))
+
+    // the inner boundary settles while its ancestor is still pending
+    resolveGate({ render: () => h('i', 'gate') })
+    await new Promise(r => setTimeout(r))
+
+    revision.value++
+    await nextTick()
+    await new Promise(r => setTimeout(r))
+    expect(serializeInner(root)).toBe(
+      '<div><div><span>child 1</span><i>gate</i></div></div>',
+    )
+  })
+
+  test('recovery render survives an out-in leave that is cut short by another toggle', async () => {
+    let resolveChild!: (comp: ComponentOptions) => void
+    const AsyncChild = defineAsyncComp(
+      () => new Promise<ComponentOptions>(r => (resolveChild = r)),
+    )
+    const show = ref(false)
+    const Entry = {
+      name: 'Entry',
+      render: () => h('div', [show.value ? h(AsyncChild) : null]),
+    }
+    const Other = defineAsyncComponent({ render: () => h('div', 'other') })
+    const Third = { render: () => h('div', 'third') }
+    const route = ref('page')
+    const leaves: (() => void)[] = []
+    const root = nodeOps.createElement('div')
+    const App = {
+      render: () =>
+        h(
+          BaseTransition,
+          {
+            mode: 'out-in',
+            onLeave: (_: any, done: () => void) => {
+              leaves.push(done)
+            },
+          },
+          {
+            default: () =>
+              // array children: the transition hooks must land on the very
+              // vnode KeepAlive renders, as compiled templates do
+              h(KeepAlive, { include: 'Entry' }, [
+                h(Suspense, null, {
+                  default:
+                    route.value === 'page'
+                      ? h(Entry)
+                      : route.value === 'other'
+                        ? h(Other)
+                        : h(Third),
+                  fallback: h('div', 'loading'),
+                }),
+              ]),
+          },
+        ),
+    }
+    render(h(App), root)
+    await nextTick()
+    expect(serializeInner(root)).toBe('<div><!----></div>')
+
+    show.value = true
+    await nextTick()
+
+    route.value = 'other'
+    await nextTick()
+    // settles while Other is pending: parked
+    resolveChild({ render: () => h('span', 'child') })
+    await new Promise(r => setTimeout(r))
+
+    // Other settles: Entry starts leaving, the parked jobs ride on afterLeave
+    await Promise.all(deps)
+    await nextTick()
+    expect(leaves.length).toBe(1)
+
+    // toggled again before the leave has finished
+    route.value = 'third'
+    await nextTick()
+    leaves.forEach(done => done())
+    await nextTick()
+    expect(serializeInner(root)).toBe('<div>third</div>')
+
+    route.value = 'page'
+    await nextTick()
+    leaves.forEach(done => done())
+    await nextTick()
+    expect(serializeInner(root)).toBe('<div><span>child</span></div>')
+  })
+
+  test('deferred recovery render restores the enclosing setup context', async () => {
+    let resolveChild!: (comp: ComponentOptions) => void
+    const AsyncChild = defineAsyncComp(
+      () => new Promise<ComponentOptions>(r => (resolveChild = r)),
+    )
+    // never resolves: the boundary stays pending on it
+    const Wake = defineAsyncComp(() => new Promise<ComponentOptions>(() => {}))
+    const show = ref(false)
+    const PageA = {
+      render: () => h('div', [show.value ? h(AsyncChild) : null]),
+    }
+    const Inner = {
+      props: ['route'],
+      render(this: any) {
+        return h(Suspense, null, {
+          default: this.route === 'page' ? h(PageA) : h(Wake),
+          fallback: h('div', 'loading'),
+        })
+      },
+    }
+    const innerRoot = nodeOps.createElement('div')
+    render(h(Inner, { route: 'page' }), innerRoot)
+    show.value = true
+    await nextTick()
+    render(h(Inner, { route: 'wake' }), innerRoot)
+    // settles while Wake is pending: parked
+    resolveChild({ render: () => h('span', 'child') })
+    await new Promise(r => setTimeout(r))
+
+    // Host mounts from a scheduler flush. Its setup re-renders the nested
+    // root synchronously, which flushes the parked recovery before the
+    // setup goes on to register its hooks. the recovery render must leave
+    // the enclosing instance context alone, like any other mount
+    const mounted = vi.fn()
+    const Host = {
+      setup() {
+        render(h(Inner, { route: 'page' }), innerRoot)
+        onMounted(mounted)
+        return () => h('div', 'host')
+      },
+    }
+    const showHost = ref(false)
+    const Outer = { render: () => (showHost.value ? h(Host) : null) }
+    render(h(Outer), nodeOps.createElement('div'))
+    showHost.value = true
+    await nextTick()
+    expect(serializeInner(innerRoot)).toBe('<div><span>child</span></div>')
+    expect(mounted).toHaveBeenCalledTimes(1)
+  })
+
+  // #6416 follow up / #10017
+  test('Suspense patched during HOC async component re-mount', async () => {
+    const key = ref('k')
+    const data = ref('data')
+
+    const Async = defineAsyncComponent({
+      render() {
+        return h('div', 'async')
+      },
+    })
+
+    const Comp = {
+      render() {
+        return h(Async, { key: key.value })
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    const App = {
+      render() {
+        return h(Suspense, null, {
+          default: h(Comp, { k: key.value, data: data.value }),
+        })
+      },
+    }
+    render(h(App), root)
+    expect(serializeInner(root)).toBe(`<!---->`)
+
+    await Promise.all(deps)
+
+    // async mounted, but key change causing a new async comp to be loaded
+    key.value = 'k1'
+    await nextTick()
+
+    // patch the Suspense
+    // should not throw error due to Suspense vnode.el being null
+    data.value = 'data2'
+    await Promise.all(deps)
+  })
+
+  // #12920
+  test('unmount Suspense after async child (with defineAsyncComponent) self-triggered update', async () => {
+    const Comp = defineComponent({
+      setup() {
+        const show = ref(true)
+        onMounted(() => {
+          // trigger update
+          show.value = !show.value
+        })
+        return () =>
+          show.value
+            ? (openBlock(), createElementBlock('div', { key: 0 }, 'show'))
+            : (openBlock(), createElementBlock('div', { key: 1 }, 'hidden'))
+      },
+    })
+
+    const AsyncComp = defineAsyncComp(() => {
+      const p = new Promise(resolve => {
+        resolve(Comp)
+      })
+      deps.push(p.then(() => Promise.resolve()))
+      return p as any
+    })
+
+    const toggle = ref(true)
+    const root = nodeOps.createElement('div')
+    const App = {
+      render() {
+        return (
+          openBlock(),
+          createElementBlock(
+            Fragment,
+            null,
+            [
+              h('h1', null, toggle.value),
+              toggle.value
+                ? (openBlock(),
+                  createBlock(
+                    Suspense,
+                    { key: 0 },
+                    {
+                      default: h(AsyncComp),
+                    },
+                  ))
+                : createCommentVNode('v-if', true),
+            ],
+            PatchFlags.STABLE_FRAGMENT,
+          )
+        )
+      },
+    }
+    render(h(App), root)
+    expect(serializeInner(root)).toBe(`<h1>true</h1><!---->`)
+
+    await Promise.all(deps)
+    await nextTick()
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<h1>true</h1><div>show</div>`)
+
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<h1>true</h1><div>hidden</div>`)
+
+    // unmount suspense
+    toggle.value = false
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<h1>true</h1><!--v-if-->`)
+  })
+
+  test('unmount Suspense after async child (with async setup) self-triggered update', async () => {
+    const AsyncComp = defineComponent({
+      async setup() {
+        const show = ref(true)
+        onMounted(() => {
+          // trigger update
+          show.value = !show.value
+        })
+        const p = new Promise(r => setTimeout(r, 1))
+        // extra tick needed for Node 12+
+        deps.push(p.then(() => Promise.resolve()))
+        return () =>
+          show.value
+            ? (openBlock(), createElementBlock('div', { key: 0 }, 'show'))
+            : (openBlock(), createElementBlock('div', { key: 1 }, 'hidden'))
+      },
+    })
+
+    const toggle = ref(true)
+    const root = nodeOps.createElement('div')
+    const App = {
+      render() {
+        return (
+          openBlock(),
+          createElementBlock(
+            Fragment,
+            null,
+            [
+              h('h1', null, toggle.value),
+              toggle.value
+                ? (openBlock(),
+                  createBlock(
+                    Suspense,
+                    { key: 0 },
+                    {
+                      default: h(AsyncComp),
+                    },
+                  ))
+                : createCommentVNode('v-if', true),
+            ],
+            PatchFlags.STABLE_FRAGMENT,
+          )
+        )
+      },
+    }
+    render(h(App), root)
+    expect(serializeInner(root)).toBe(`<h1>true</h1><!---->`)
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<h1>true</h1><div>hidden</div>`)
+
+    // unmount suspense
+    toggle.value = false
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<h1>true</h1><!--v-if-->`)
+  })
+
+  test('propagates host el through wrapper components above Suspense after async child self-triggered update', async () => {
+    const AsyncComp = defineComponent({
+      async setup() {
+        const show = ref(true)
+        onMounted(() => {
+          show.value = false
+        })
+        const p = new Promise(r => setTimeout(r, 1))
+        deps.push(p.then(() => Promise.resolve()))
+        return () =>
+          h(
+            'div',
+            { key: show.value ? 'show' : 'hidden' },
+            show.value ? 'show' : 'hidden',
+          )
+      },
+    })
+
+    const Inner = defineComponent({
+      render() {
+        return h(Suspense, null, {
+          default: () => h(AsyncComp),
+        })
+      },
+    })
+
+    const Outer = defineComponent({
+      render() {
+        return h(Inner)
+      },
+    })
+
+    const root = nodeOps.createElement('div')
+    const vnode = h(Outer)
+    render(vnode, root)
+    expect(serializeInner(root)).toBe(`<!---->`)
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>hidden</div>`)
+
+    const renderedEl = root.children[0]
+    const innerVNode = vnode.component!.subTree
+    const suspenseVNode = innerVNode.component!.subTree
+
+    expect(suspenseVNode.el).toBe(renderedEl)
+    expect(innerVNode.el).toBe(renderedEl)
+    expect(vnode.el).toBe(renderedEl)
+  })
+
+  test('should mount after suspense is resolved', async () => {
+    const target = nodeOps.createElement('div')
+
+    const Async = defineAsyncComponent({
+      render() {
+        return h('div', 'async')
+      },
+    })
+
+    const Comp = {
+      setup() {
+        return () =>
+          h(Suspense, null, {
+            default: h('div', null, [
+              h(Async),
+              h(Teleport, { to: target }, h('div', 'teleported')),
+            ]),
+            fallback: h('div', 'fallback'),
+          })
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+    expect(serializeInner(target)).toBe(``)
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe(
+      `<div><div>async</div><!--teleport start--><!--teleport end--></div>`,
+    )
+    expect(serializeInner(target)).toBe(`<div>teleported</div>`)
+  })
+
+  test('should patch teleport before suspense is resolved', async () => {
+    const target = nodeOps.createElement('div')
+    const text = ref('one')
+
+    const Async = defineAsyncComponent({
+      render() {
+        return h('div', 'async')
+      },
+    })
+
+    const Comp = {
+      setup() {
+        return () =>
+          h(Suspense, null, {
+            default: h('div', null, [
+              h(Async),
+              h(Teleport, { to: target }, h('div', text.value)),
+            ]),
+            fallback: h('div', 'fallback'),
+          })
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+    expect(serializeInner(target)).toBe(``)
+
+    text.value = 'two'
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+    expect(serializeInner(target)).toBe(``)
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe(
+      `<div><div>async</div><!--teleport start--><!--teleport end--></div>`,
+    )
+    expect(serializeInner(target)).toBe(`<div>two</div>`)
+  })
+
+  test('should handle disabled teleport updates before suspense is resolved', async () => {
+    const target = nodeOps.createElement('div')
+    const disabled = ref(false)
+
+    const Async = defineAsyncComponent({
+      render() {
+        return h('div', 'async')
+      },
+    })
+
+    const Comp = {
+      setup() {
+        return () =>
+          h(Suspense, null, {
+            default: h('div', null, [
+              h(Async),
+              h(
+                Teleport,
+                { to: target, disabled: disabled.value },
+                h('div', 'teleported'),
+              ),
+            ]),
+            fallback: h('div', 'fallback'),
+          })
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+    expect(serializeInner(target)).toBe(``)
+
+    disabled.value = true
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+    expect(serializeInner(target)).toBe(``)
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe(
+      `<div><div>async</div><!--teleport start--><div>teleported</div><!--teleport end--></div>`,
+    )
+    expect(serializeInner(target)).toBe(``)
+  })
+
+  test('should not mount discarded teleport after suspense is resolved', async () => {
+    const target = nodeOps.createElement('div')
+    const showTeleport = ref(true)
+
+    const Async = defineAsyncComponent({
+      render() {
+        return h('div', 'async')
+      },
+    })
+
+    const Comp = {
+      setup() {
+        return () => {
+          const children = [h(Async)]
+          if (showTeleport.value) {
+            children.push(h(Teleport, { to: target }, h('div', 'teleported')))
+          }
+          return h(Suspense, null, {
+            default: h('div', null, children),
+            fallback: h('div', 'fallback'),
+          })
+        }
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+    expect(serializeInner(target)).toBe(``)
+
+    showTeleport.value = false
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+    expect(serializeInner(target)).toBe(``)
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div><div>async</div></div>`)
+    expect(serializeInner(target)).toBe(``)
+  })
+
+  // #14876
+  test('should not mount discarded teleport with component child after suspense is resolved', async () => {
+    const target = nodeOps.createElement('div')
+    const showTeleport = ref(true)
+
+    const Async = defineAsyncComponent({
+      render() {
+        return h('div', 'async')
+      },
+    })
+
+    const Inner = {
+      render() {
+        return h('div', 'inner')
+      },
+    }
+
+    const Comp = {
+      setup() {
+        return () => {
+          const children = [h(Async)]
+          if (showTeleport.value) {
+            children.push(h(Teleport, { to: target }, h(Inner)))
+          }
+          return h(Suspense, null, {
+            default: h('div', null, children),
+            fallback: h('div', 'fallback'),
+          })
+        }
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+    expect(serializeInner(target)).toBe(``)
+
+    showTeleport.value = false
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+    expect(serializeInner(target)).toBe(``)
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div><div>async</div></div>`)
+    expect(serializeInner(target)).toBe(``)
+  })
+
+  test('should not process discarded disabled teleport update after suspense is resolved', async () => {
+    const target = nodeOps.createElement('div')
+    const showTeleport = ref(true)
+    const disabled = ref(false)
+
+    const Async = defineAsyncComponent({
+      render() {
+        return h('div', 'async')
+      },
+    })
+
+    const Comp = {
+      setup() {
+        return () => {
+          const children = [h(Async)]
+          if (showTeleport.value) {
+            children.push(
+              h(
+                Teleport,
+                { to: target, disabled: disabled.value },
+                h('div', 'teleported'),
+              ),
+            )
+          }
+          return h(Suspense, null, {
+            default: h('div', null, children),
+            fallback: h('div', 'fallback'),
+          })
+        }
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+    expect(serializeInner(target)).toBe(``)
+
+    disabled.value = true
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+    expect(serializeInner(target)).toBe(``)
+
+    showTeleport.value = false
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+    expect(serializeInner(target)).toBe(``)
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div><div>async</div></div>`)
+    expect(serializeInner(target)).toBe(``)
+  })
+
+  // #14701
+  test('should not crash when moving disabled teleport with component children inside suspense', async () => {
+    const target = nodeOps.createElement('div')
+
+    const Comp = {
+      render() {
+        return h('div', 'comp')
+      },
+    }
+
+    const Async = defineAsyncComponent({
+      render() {
+        // Multi-root fragment: element + disabled teleport with component child
+        return [
+          h('div', 'content'),
+          h(Teleport, { to: target, disabled: true }, h(Comp)),
+        ]
+      },
+    })
+
+    const root = nodeOps.createElement('div')
+    render(
+      h(Suspense, null, {
+        default: h(Async),
+        fallback: h('div', 'fallback'),
+      }),
+      root,
+    )
+    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+
+    await Promise.all(deps)
+    await nextTick()
+    await nextTick()
+    expect(serializeInner(root)).toBe(
+      `<div>content</div><!--teleport start--><div>comp</div><!--teleport end-->`,
+    )
+  })
+
+  //#11617
+  test('update async component before resolve then update again', async () => {
+    const arr: boolean[] = []
+    const Child = {
+      props: ['loading'],
+      async setup(props: any) {
+        onUpdated(() => {
+          arr.push(props.loading)
+        })
+        await 1
+        return () => {
+          const loading = props.loading
+          return h('div', null, loading ? '1' : '2')
+        }
+      },
+    }
+
+    const Parent = defineComponent({
+      setup() {
+        const loading = ref(false)
+        const delay = (delayInms: any) => {
+          return new Promise(resolve => setTimeout(resolve, delayInms))
+        }
+        onMounted(async () => {
+          loading.value = true
+          await delay(1000)
+          loading.value = false
+          await nextTick()
+          expect(arr).toEqual([true, false])
+        })
+        return () => {
+          return h(Child, { loading: loading.value })
+        }
+      },
+    })
+
+    const RouterView = {
+      props: {
+        name: { type: Object },
+      },
+      setup(props: any) {
+        return () => {
+          const name = props.name
+          return h(name)
+        }
+      },
+    }
+    const App = {
+      setup() {
+        const Dummy = {
+          setup() {
+            return () => {
+              return h('div', null, 'dummy')
+            }
+          },
+        }
+
+        const flag: any = shallowRef(Dummy)
+
+        onMounted(() => {
+          flag.value = Parent
+        })
+        return () => {
+          return h(Suspense, null, {
+            default: () => h(RouterView, { name: flag.value }),
+          })
+        }
+      },
+    }
+
+    const root: any = nodeOps.createElement('div')
+
+    render(h(App), root)
+  })
+
+  // #13453
+  test('add new async deps during patching', async () => {
+    const getComponent = (type: string) => {
+      if (type === 'A') {
+        return defineAsyncComponent({
+          setup() {
+            return () => h('div', 'A')
+          },
+        })
+      }
+      return defineAsyncComponent({
+        setup() {
+          return () => h('div', 'B')
+        },
+      })
+    }
+
+    const types = ref(['A'])
+    const add = async () => {
+      types.value.push('B')
+    }
+
+    const update = async () => {
+      // mount Suspense B
+      // [Suspense A] -> [Suspense A(pending), Suspense B(pending)]
+      await add()
+      // patch Suspense B (still pending)
+      // [Suspense A(pending), Suspense B(pending)] -> [Suspense B(pending)]
+      types.value.shift()
+    }
+
+    const Comp = {
+      render(this: any) {
+        return h(Fragment, null, [
+          renderList(types.value, type => {
+            return h(
+              Suspense,
+              { key: type },
+              {
+                default: () => [
+                  renderSlot(this.$slots, 'default', { type: type }),
+                ],
+              },
+            )
+          }),
+        ])
+      },
+    }
+
+    const App = {
+      setup() {
+        return () =>
+          h(Comp, null, {
+            default: (params: any) => [h(getComponent(params.type))],
+          })
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(App), root)
+    expect(serializeInner(root)).toBe(`<!---->`)
+
+    await Promise.all(deps)
+    expect(serializeInner(root)).toBe(`<div>A</div>`)
+
+    update()
+    await nextTick()
+    // wait for both A and B to resolve
+    await Promise.all(deps)
+    // wait for new B to resolve
+    await Promise.all(deps)
+    expect(serializeInner(root)).toBe(`<div>B</div>`)
+  })
+
+  describe('warnings', () => {
+    // base function to check if a combination of slots warns or not
+    function baseCheckWarn(
+      shouldWarn: boolean,
+      children: RawSlots,
+      props: SuspenseProps | null = null,
+    ) {
+      const Comp = {
+        setup() {
+          return () => h(Suspense, props, children)
+        },
+      }
+
+      const root = nodeOps.createElement('div')
+      render(h(Comp), root)
+
+      if (shouldWarn) {
+        expect(`<Suspense> slots expect a single root node.`).toHaveBeenWarned()
+      } else {
+        expect(
+          `<Suspense> slots expect a single root node.`,
+        ).not.toHaveBeenWarned()
+      }
+    }
+
+    // actual function that we use in tests
+    const checkWarn = baseCheckWarn.bind(null, true)
+    const checkNoWarn = baseCheckWarn.bind(null, false)
+
+    test('does not warn on single child', async () => {
+      checkNoWarn({
+        default: h('div'),
+        fallback: h('div'),
+      })
+    })
+
+    test('does not warn on null', async () => {
+      checkNoWarn({
+        default: null,
+        fallback: null,
+      })
+    })
+
+    test('does not warn on <component :is="null" />', async () => {
+      checkNoWarn({
+        default: () => [resolveDynamicComponent(null)],
+        fallback: () => null,
+      })
+    })
+
+    test('does not warn on empty array', async () => {
+      checkNoWarn({
+        default: [],
+        fallback: () => [],
+      })
+    })
+
+    test('warns on multiple children in default', async () => {
+      checkWarn({
+        default: [h('div'), h('div')],
+      })
+    })
+
+    test('warns on multiple children in fallback', async () => {
+      checkWarn({
+        default: h('div'),
+        fallback: [h('div'), h('div')],
+      })
+    })
+
+    // #13559
+    test('renders multiple async components in Suspense with v-for and updates on items change', async () => {
+      const CompAsyncSetup = defineAsyncComponent({
+        props: ['item'],
+        render(ctx: any) {
+          return h('div', ctx.item.name)
+        },
+      })
+
+      const items = ref([
+        { id: 1, name: '111' },
+        { id: 2, name: '222' },
+        { id: 3, name: '333' },
+      ])
+
+      const Comp = {
+        setup() {
+          return () =>
+            h(Suspense, null, {
+              default: () =>
+                h(
+                  Fragment,
+                  null,
+                  items.value.map(item =>
+                    h(CompAsyncSetup, { item, key: item.id }),
+                  ),
+                ),
+            })
+        },
+      }
+
+      const root = nodeOps.createElement('div')
+      render(h(Comp), root)
+      await nextTick()
+      await Promise.all(deps)
+
+      expect(serializeInner(root)).toBe(
+        `<div>111</div><div>222</div><div>333</div>`,
+      )
+
+      items.value = [
+        { id: 4, name: '444' },
+        { id: 5, name: '555' },
+        { id: 6, name: '666' },
+      ]
+      await nextTick()
+      await Promise.all(deps)
+      expect(serializeInner(root)).toBe(
+        `<div>444</div><div>555</div><div>666</div>`,
+      )
+    })
+
+    // #14173
+    test('nested async components with v-for + only Suspense and async component wrappers', async () => {
+      const CompAsyncSetup = defineAsyncComponent({
+        props: ['item', 'id'],
+        render(ctx: any) {
+          return h('div', ctx.id + '-' + ctx.item.name)
+        },
+      })
+      const items = ref([
+        { id: 1, name: 'a' },
+        { id: 2, name: 'b' },
+        { id: 3, name: 'c' },
+      ])
+      const Comp = {
+        props: ['id'],
+        setup(props: any) {
+          return () =>
+            h(Suspense, null, {
+              default: () =>
+                h(
+                  Fragment,
+                  null,
+                  items.value.map(item =>
+                    h(CompAsyncSetup, {
+                      item,
+                      key: item.id,
+                      id: props.id,
+                    }),
+                  ),
+                ),
+            })
+        },
+      }
+
+      const CompAsyncWrapper = defineAsyncComponent({
+        props: ['id'],
+        render(ctx: any) {
+          return h(Comp, { id: ctx.id })
+        },
+      })
+      const CompWrapper = defineComponent({
+        props: ['id'],
+        render(ctx: any) {
+          return h(CompAsyncWrapper, { id: ctx.id })
+        },
+      })
+      const list = ref([{ id: 1 }, { id: 2 }, { id: 3 }])
+
+      const App = {
+        setup() {
+          return () =>
+            h(Suspense, null, {
+              default: () =>
+                h(
+                  Fragment,
+                  null,
+                  list.value.map(item =>
+                    h(CompWrapper, { id: item.id, key: item.id }),
+                  ),
+                ),
+            })
+        },
+      }
+
+      const root = nodeOps.createElement('div')
+      render(h(App), root)
+      await nextTick()
+      await Promise.all(deps)
+      await Promise.all(deps)
+
+      expect(serializeInner(root)).toBe(
+        `<div>1-a</div><div>1-b</div><div>1-c</div><div>2-a</div><div>2-b</div><div>2-c</div><div>3-a</div><div>3-b</div><div>3-c</div>`,
+      )
+
+      list.value = [{ id: 4 }, { id: 5 }, { id: 6 }]
+      await nextTick()
+      await Promise.all(deps)
+      await Promise.all(deps)
+      expect(serializeInner(root)).toBe(
+        `<div>4-a</div><div>4-b</div><div>4-c</div><div>5-a</div><div>5-b</div><div>5-c</div><div>6-a</div><div>6-b</div><div>6-c</div>`,
+      )
+
+      items.value = [
+        { id: 4, name: 'd' },
+        { id: 5, name: 'f' },
+        { id: 6, name: 'g' },
+      ]
+      await nextTick()
+      await Promise.all(deps)
+      await Promise.all(deps)
+      expect(serializeInner(root)).toBe(
+        `<div>4-d</div><div>4-f</div><div>4-g</div><div>5-d</div><div>5-f</div><div>5-g</div><div>6-d</div><div>6-f</div><div>6-g</div>`,
+      )
+    })
+
+    test('should call unmounted directive once when fallback is replaced by resolved async component', async () => {
+      const Comp = {
+        render() {
+          return h('div', null, 'comp')
+        },
+      }
+      const Foo = defineAsyncComponent({
+        render() {
+          return h(Comp)
+        },
+      })
+      const unmounted = vi.fn(el => {
+        el.foo = null
+      })
+      const vDir = {
+        unmounted,
+      }
+      const App = {
+        setup() {
+          return () => {
+            return h(Suspense, null, {
+              fallback: () => withDirectives(h('div'), [[vDir, true]]),
+              default: () => h(Foo),
+            })
+          }
+        },
+      }
+      const root = nodeOps.createElement('div')
+      render(h(App), root)
+
+      await Promise.all(deps)
+      await nextTick()
+      expect(unmounted).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  describe('async setup with top-level await', () => {
+    test('pending branch replaced before async setup resolves', async () => {
+      const updateSpy = vi.fn()
+      const stateRef = ref(0)
+      let resolvePending!: (v?: unknown) => void
+
+      const SlowComp = defineComponent({
+        async setup() {
+          let __temp: any, __restore: any
+          ;[__temp, __restore] = withAsyncContext(
+            () =>
+              new Promise(r => {
+                resolvePending = r
+              }),
+          )
+          __temp = await __temp
+          __restore()
+
+          watch(stateRef, updateSpy)
+
+          return () => h('div', 'slow')
+        },
+      })
+
+      const FillerComp = defineComponent({
+        setup: () => () => h('div', 'filler'),
+      })
+
+      const view = shallowRef<any>(SlowComp)
+      const Comp = defineComponent({
+        setup: () => () =>
+          h(Suspense, null, {
+            default: h(view.value),
+            fallback: h('div', 'fallback'),
+          }),
+      })
+
+      const root = nodeOps.createElement('div')
+      render(h(Comp), root)
+      expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+
+      view.value = FillerComp
+      await nextTick()
+      expect(serializeInner(root)).toBe(`<div>filler</div>`)
+
+      // wait a macro task tick for all micro ticks to resolve
+      resolvePending(undefined)
+      await new Promise(r => setTimeout(r))
+
+      stateRef.value++
+      await nextTick()
+      expect(updateSpy).not.toHaveBeenCalled()
+    })
+
+    test('boundary unmounted before async setup resolves', async () => {
+      const updateSpy = vi.fn()
+      const stateRef = ref(0)
+      let resolvePending!: (v?: unknown) => void
+
+      const SlowComp = defineComponent({
+        async setup() {
+          let __temp: any, __restore: any
+          ;[__temp, __restore] = withAsyncContext(
+            () =>
+              new Promise(r => {
+                resolvePending = r
+              }),
+          )
+          __temp = await __temp
+          __restore()
+
+          watch(stateRef, updateSpy)
+
+          return () => h('div', 'slow')
+        },
+      })
+
+      const root = nodeOps.createElement('div')
+      render(
+        h(() =>
+          h(Suspense, null, {
+            default: h(SlowComp),
+            fallback: h('div', 'fallback'),
+          }),
+        ),
+        root,
+      )
+      expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+
+      render(null, root)
+
+      resolvePending(undefined)
+      await new Promise(r => setTimeout(r))
+
+      stateRef.value++
+      await nextTick()
+      expect(updateSpy).not.toHaveBeenCalled()
+    })
+
+    test('repeated branch replacement before async setup resolves', async () => {
+      const updateSpy = vi.fn()
+      const stateRef = ref(0)
+      const resolvers: Array<(v?: unknown) => void> = []
+
+      const SlowComp = defineComponent({
+        async setup() {
+          let __temp: any, __restore: any
+          ;[__temp, __restore] = withAsyncContext(
+            () =>
+              new Promise(r => {
+                resolvers.push(r)
+              }),
+          )
+          __temp = await __temp
+          __restore()
+
+          const uid = getCurrentInstance()!.uid
+          watch(stateRef, () => {
+            updateSpy(uid)
+          })
+
+          return () => h('div', 'slow')
+        },
+      })
+
+      const FillerComp = defineComponent({
+        setup: () => () => h('div', 'filler'),
+      })
+
+      const view = shallowRef<any>(FillerComp)
+      const Comp = defineComponent({
+        setup: () => () =>
+          h(Suspense, null, {
+            default: h(view.value),
+            fallback: h('div', 'fallback'),
+          }),
+      })
+
+      const root = nodeOps.createElement('div')
+      render(h(Comp), root)
+      expect(serializeInner(root)).toBe(`<div>filler</div>`)
+
+      for (let i = 0; i < 3; i++) {
+        view.value = SlowComp
+        await nextTick()
+        view.value = FillerComp
+        await nextTick()
+      }
+
+      expect(resolvers.length).toBe(3)
+      resolvers.forEach(r => r(undefined))
+      await new Promise(r => setTimeout(r))
+
+      stateRef.value++
+      await nextTick()
+      expect(updateSpy).not.toHaveBeenCalled()
+    })
+
+    test('nested scope created after pending branch is abandoned', async () => {
+      const updateSpy = vi.fn()
+      const stateRef = ref(0)
+      let resolvePending!: (v?: unknown) => void
+
+      const SlowComp = defineComponent({
+        async setup() {
+          let __temp: any, __restore: any
+          ;[__temp, __restore] = withAsyncContext(
+            () =>
+              new Promise(r => {
+                resolvePending = r
+              }),
+          )
+          __temp = await __temp
+          __restore()
+
+          effectScope().run(() => {
+            watch(stateRef, updateSpy)
+          })
+
+          return () => h('div', 'slow')
+        },
+      })
+
+      const FillerComp = defineComponent({
+        setup: () => () => h('div', 'filler'),
+      })
+
+      const view = shallowRef<any>(SlowComp)
+      const Comp = defineComponent({
+        setup: () => () =>
+          h(Suspense, null, {
+            default: h(view.value),
+            fallback: h('div', 'fallback'),
+          }),
+      })
+
+      const root = nodeOps.createElement('div')
+      render(h(Comp), root)
+      expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+
+      view.value = FillerComp
+      await nextTick()
+      expect(serializeInner(root)).toBe(`<div>filler</div>`)
+
+      resolvePending(undefined)
+      await new Promise(r => setTimeout(r))
+
+      stateRef.value++
+      await nextTick()
+      expect(updateSpy).not.toHaveBeenCalled()
+    })
+
+    test('onScopeDispose after pending branch is abandoned', async () => {
+      const dispose = vi.fn()
+      let resolvePending!: (v?: unknown) => void
+
+      const SlowComp = defineComponent({
+        async setup() {
+          let __temp: any, __restore: any
+          ;[__temp, __restore] = withAsyncContext(
+            () =>
+              new Promise(r => {
+                resolvePending = r
+              }),
+          )
+          __temp = await __temp
+          __restore()
+
+          onScopeDispose(dispose)
+
+          return () => h('div', 'slow')
+        },
+      })
+
+      const FillerComp = defineComponent({
+        setup: () => () => h('div', 'filler'),
+      })
+
+      const view = shallowRef<any>(SlowComp)
+      const Comp = defineComponent({
+        setup: () => () =>
+          h(Suspense, null, {
+            default: h(view.value),
+            fallback: h('div', 'fallback'),
+          }),
+      })
+
+      const root = nodeOps.createElement('div')
+      render(h(Comp), root)
+      expect(serializeInner(root)).toBe(`<div>fallback</div>`)
+
+      view.value = FillerComp
+      await nextTick()
+      expect(serializeInner(root)).toBe(`<div>filler</div>`)
+
+      resolvePending(undefined)
+      await new Promise(r => setTimeout(r))
+
+      expect(dispose).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  test.each([true, false])(
+    'skip rendering an unmounted async child (resolves first: %s)',
+    async resolvesFirst => {
+      const show = ref(true)
+      const renderRemoved = vi.fn(() => h('b', 'removed'))
+      const onResolve = vi.fn()
+      let resolveRemoved!: () => void
+      let resolveSibling!: () => void
+      const Removed = {
+        async setup() {
+          await new Promise<void>(resolve => {
+            resolveRemoved = resolve
+          })
+          return renderRemoved
+        },
+      }
+      const Sibling = {
+        async setup() {
+          await new Promise<void>(resolve => {
+            resolveSibling = resolve
+          })
+          return () => h('span', 'kept')
+        },
+      }
+      const app = createApp({
+        components: { Removed, Sibling },
+        setup: () => ({ show, onResolve }),
+        template: `
+          <Suspense @resolve="onResolve">
+            <div><Removed v-if="show" /><Sibling /></div>
+            <template #fallback><p>loading</p></template>
+          </Suspense>`,
+      })
+      const root = document.createElement('div')
+      app.mount(root)
+      expect(root.innerHTML).toBe('<p>loading</p>')
+
+      show.value = false
+      await nextTick()
+      expect(root.innerHTML).toBe('<p>loading</p>')
+
+      ;(resolvesFirst ? resolveRemoved : resolveSibling)()
+      await new Promise(r => setTimeout(r))
+      expect(root.innerHTML).toBe('<p>loading</p>')
+      expect(renderRemoved).not.toHaveBeenCalled()
+      expect(onResolve).not.toHaveBeenCalled()
+
+      ;(resolvesFirst ? resolveSibling : resolveRemoved)()
+      await new Promise(r => setTimeout(r))
+      expect(root.textContent).toBe('kept')
+      expect(renderRemoved).not.toHaveBeenCalled()
+      expect(onResolve).toHaveBeenCalledTimes(1)
+      app.unmount()
+    },
+  )
+  // async setup() has not resolved: the component is only represented by its
+  // placeholder comment, which its unmount must take along
+  test('removes the placeholder of a pending async child unmounted in the active branch', async () => {
+    const show = ref(false)
+    const Async = {
+      async setup() {
+        await new Promise(() => {})
+        return () => h('div', 'async')
+      },
+    }
+    const App = {
+      render: () =>
+        h(Suspense, null, {
+          default: h('div', [
+            show.value ? h(Async) : createCommentVNode('v-if'),
+          ]),
+          fallback: h('p', 'loading'),
+        }),
+    }
+    const root = nodeOps.createElement('div')
+    render(h(App), root)
+    expect(serializeInner(root)).toBe('<div><!--v-if--></div>')
+
+    show.value = true
+    await nextTick()
+    expect(serializeInner(root)).toBe('<div><!----></div>')
+
+    show.value = false
+    await nextTick()
+    expect(serializeInner(root)).toBe('<div><!--v-if--></div>')
+  })
+
+  test('removes the placeholders of pending async children unmounted in the pending branch', async () => {
+    const show = ref(true)
+    let resolveDep!: () => void
+    const resolveAsync: (() => void)[] = []
+    const Dep = {
+      async setup() {
+        await new Promise<void>(resolve => {
+          resolveDep = resolve
+        })
+        return () => h('span', 'dep')
+      },
+    }
+    const Async = {
+      async setup() {
+        await new Promise<void>(resolve => {
+          resolveAsync.push(resolve)
+        })
+        return () => h('div', 'async')
+      },
+    }
+    const App = {
+      render: () =>
+        h(Suspense, null, {
+          default: h('div', [
+            h(Dep),
+            show.value ? h(Async) : createCommentVNode('v-if'),
+          ]),
+          fallback: h('p', 'loading'),
+        }),
+    }
+    const root = nodeOps.createElement('div')
+    render(h(App), root)
+    expect(serializeInner(root)).toBe('<p>loading</p>')
+
+    for (let i = 0; i < 2; i++) {
+      show.value = false
+      await nextTick()
+      show.value = true
+      await nextTick()
+    }
+    show.value = false
+    await nextTick()
+    expect(resolveAsync.length).toBe(3)
+    expect(serializeInner(root)).toBe('<p>loading</p>')
+
+    // the discarded instances still release their deps on resolve
+    resolveDep()
+    resolveAsync.forEach(resolve => resolve())
+    await new Promise(r => setTimeout(r))
+    expect(serializeInner(root)).toBe('<div><span>dep</span><!--v-if--></div>')
+  })
+
+  test.each([
+    { unmount: 'none', captureOuter: true },
+    { unmount: 'boundary', captureOuter: true },
+    { unmount: 'boundary', captureOuter: false },
+    { unmount: 'app', captureOuter: true },
+    { unmount: 'branch', captureOuter: true },
+    { unmount: 'branch', captureOuter: false },
+  ])(
+    'async setup rejection (unmount: $unmount, capture outer: $captureOuter)',
+    async ({ unmount, captureOuter }) => {
+      const error = new Error('request failed')
+      let reject!: (error: Error) => void
+      const pending = new Promise<void>((_, rejectPending) => {
+        reject = rejectPending
+      })
+      const innerHandler = vi.fn(() => false)
+      const outerHandler = vi.fn(() => (captureOuter ? false : undefined))
+      const appHandler = vi.fn()
+      const renderAsync = vi.fn(() => h('div', 'ready'))
+      const show = ref(true)
+      const Async = {
+        async setup() {
+          await pending
+        },
+        render: renderAsync,
+      }
+      const Boundary = {
+        setup() {
+          onErrorCaptured(innerHandler)
+          return () =>
+            unmount === 'branch'
+              ? h(Async)
+              : h(Suspense, null, {
+                  default: () => h(Async),
+                  fallback: () => h('p', 'loading'),
+                })
+        },
+      }
+      const app = createApp({
+        setup() {
+          onErrorCaptured(outerHandler)
+          const content = () => (show.value ? h(Boundary) : h('p', 'left'))
+          return unmount === 'branch'
+            ? () =>
+                h(Suspense, null, {
+                  default: content,
+                  fallback: () => h('p', 'loading'),
+                })
+            : content
+        },
+      })
+      app.config.errorHandler = appHandler
+      const root = document.createElement('div')
+      app.mount(root)
+      expect(root.innerHTML).toBe('<p>loading</p>')
+
+      if (unmount === 'boundary' || unmount === 'branch') {
+        show.value = false
+      } else if (unmount === 'app') {
+        app.unmount()
+      }
+      await nextTick()
+
+      reject(error)
+      // Drain the async setup rejection and Suspense's promise chain.
+      await new Promise(r => setTimeout(r))
+
+      if (unmount === 'none') {
+        expect(innerHandler).toHaveBeenCalledTimes(1)
+        expect(innerHandler).toHaveBeenCalledWith(
+          error,
+          expect.any(Object),
+          'setup function',
+        )
+        expect(outerHandler).not.toHaveBeenCalled()
+        expect(appHandler).not.toHaveBeenCalled()
+      } else {
+        expect(innerHandler).not.toHaveBeenCalled()
+        if (unmount === 'boundary' || unmount === 'branch') {
+          expect(outerHandler).toHaveBeenCalledTimes(1)
+          expect(outerHandler).toHaveBeenCalledWith(
+            error,
+            expect.any(Object),
+            'setup function',
+          )
+        } else {
+          expect(outerHandler).not.toHaveBeenCalled()
+        }
+        if (unmount === 'app' || !captureOuter) {
+          expect(appHandler).toHaveBeenCalledTimes(1)
+          expect(appHandler).toHaveBeenCalledWith(
+            error,
+            expect.any(Object),
+            'setup function',
+          )
+        } else {
+          expect(appHandler).not.toHaveBeenCalled()
+        }
+        expect(renderAsync).not.toHaveBeenCalled()
+        expect(root.innerHTML).toBe(unmount === 'app' ? '' : '<p>left</p>')
+      }
+      if (unmount !== 'app') app.unmount()
+    },
+  )
+
+  test.each([
+    { source: 'setup', replaceBranch: false },
+    { source: 'loader', replaceBranch: false },
+    { source: 'loader', replaceBranch: true },
+    { source: 'watcher', replaceBranch: false },
+    { source: 'teardown', replaceBranch: false },
+  ])(
+    'late $source rejection after removing a pending boundary (replace branch: $replaceBranch)',
+    async ({ source, replaceBranch }) => {
+      const error = new Error('request failed')
+      let reject!: (error: Error) => void
+      const pending = new Promise<void>((_, rejectPending) => {
+        reject = rejectPending
+      })
+      let resolveSibling!: () => void
+      const Sibling = {
+        async setup() {
+          await new Promise<void>(resolve => {
+            resolveSibling = resolve
+          })
+          return () => h('span', 'kept')
+        },
+      }
+      const renderChild = vi.fn(() => h('span', 'child'))
+      const Child =
+        source === 'loader'
+          ? defineAsyncComp(() => pending.then(() => ({ render: renderChild })))
+          : {
+              setup() {
+                if (source === 'setup') {
+                  return pending.then(() => renderChild)
+                }
+                if (source === 'watcher') {
+                  watch(ref(0), () => pending, { immediate: true })
+                } else {
+                  onBeforeUnmount(() => pending)
+                }
+                return renderChild
+              },
+            }
+      const innerHandler = vi.fn(() => false)
+      const outerHandler = vi.fn(() => false)
+      const appHandler = vi.fn()
+      const onResolve = vi.fn()
+      const show = ref(true)
+      const Boundary = {
+        components: { Child, Sibling },
+        setup() {
+          onErrorCaptured(innerHandler)
+        },
+        template: replaceBranch
+          ? '<div><Child /><Sibling /></div>'
+          : '<Child />',
+      }
+      const app = createApp({
+        components: { Boundary, Sibling },
+        setup() {
+          onErrorCaptured(outerHandler)
+          return { show, onResolve }
+        },
+        template: replaceBranch
+          ? `<Suspense @resolve="onResolve">
+               <Boundary v-if="show" /><p v-else>left</p>
+               <template #fallback><p>loading</p></template>
+             </Suspense>`
+          : `<Suspense @resolve="onResolve">
+               <div><Boundary v-if="show" /><Sibling /></div>
+               <template #fallback><p>loading</p></template>
+             </Suspense>`,
+      })
+      app.config.errorHandler = appHandler
+      const root = document.createElement('div')
+      app.mount(root)
+      expect(root.innerHTML).toBe('<p>loading</p>')
+
+      show.value = false
+      await nextTick()
+      expect(root.innerHTML).toBe(
+        replaceBranch ? '<p>left</p>' : '<p>loading</p>',
+      )
+
+      reject(error)
+      await new Promise(r => setTimeout(r))
+
+      expect(innerHandler).not.toHaveBeenCalled()
+      expect(outerHandler).toHaveBeenCalledTimes(1)
+      expect(outerHandler).toHaveBeenCalledWith(
+        error,
+        expect.any(Object),
+        source === 'loader'
+          ? 'async component loader'
+          : source === 'watcher'
+            ? 'watcher callback'
+            : source === 'teardown'
+              ? 'beforeUnmount hook'
+              : 'setup function',
+      )
+      expect(appHandler).not.toHaveBeenCalled()
+      if (source === 'setup' || source === 'loader') {
+        expect(renderChild).not.toHaveBeenCalled()
+      }
+      if (!replaceBranch) {
+        expect(root.innerHTML).toBe('<p>loading</p>')
+        expect(onResolve).not.toHaveBeenCalled()
+      }
+
+      resolveSibling()
+      await new Promise(r => setTimeout(r))
+      expect(root.textContent).toBe(replaceBranch ? 'left' : 'kept')
+      expect(onResolve).toHaveBeenCalledTimes(1)
+      app.unmount()
+    },
+  )
+
+  test.each(['emit', 'hook error', 'event error'])(
+    'preserves deferred unmounted hooks (%s)',
+    async source => {
+      const error = new Error('cleanup failed')
+      const unmounted = vi.fn()
+      const cleanup = vi.fn(() => {
+        if (source === 'event error') throw error
+      })
+      const innerHandler = vi.fn(() => false)
+      const outerHandler = vi.fn(() => false)
+      const appHandler = vi.fn()
+      let resolveSibling!: () => void
+      const Sibling = {
+        async setup() {
+          await new Promise<void>(resolve => {
+            resolveSibling = resolve
+          })
+          return () => h('span', 'kept')
+        },
+      }
+      const Child = defineComponent({
+        emits: ['cleanup'],
+        setup(_, { emit }) {
+          onUnmounted(() => {
+            unmounted()
+            if (source === 'hook error') throw error
+            emit('cleanup')
+          })
+        },
+        template: '<span>child</span>',
+      })
+      const Boundary = {
+        components: { Child },
+        setup() {
+          onErrorCaptured(innerHandler)
+          return { cleanup }
+        },
+        template: '<Child @cleanup="cleanup" />',
+      }
+      const show = ref(true)
+      const app = createApp({
+        components: { Boundary, Sibling },
+        setup() {
+          onErrorCaptured(outerHandler)
+          return { show }
+        },
+        template: `
+          <Suspense>
+            <div><Boundary v-if="show" /><Sibling /></div>
+            <template #fallback><p>loading</p></template>
+          </Suspense>`,
+      })
+      app.config.errorHandler = appHandler
+      const root = document.createElement('div')
+      app.mount(root)
+      expect(root.innerHTML).toBe('<p>loading</p>')
+
+      show.value = false
+      await nextTick()
+      expect(unmounted).not.toHaveBeenCalled()
+      expect(cleanup).not.toHaveBeenCalled()
+
+      resolveSibling()
+      await new Promise(r => setTimeout(r))
+      expect(root.textContent).toBe('kept')
+      expect(unmounted).toHaveBeenCalledTimes(1)
+      expect(cleanup).toHaveBeenCalledTimes(source === 'hook error' ? 0 : 1)
+      if (source === 'emit') {
+        expect(innerHandler).not.toHaveBeenCalled()
+      } else {
+        expect(innerHandler).toHaveBeenCalledTimes(1)
+        expect(innerHandler).toHaveBeenCalledWith(
+          error,
+          expect.any(Object),
+          source === 'hook error'
+            ? 'unmounted hook'
+            : 'component event handler',
+        )
+      }
+      expect(outerHandler).not.toHaveBeenCalled()
+      expect(appHandler).not.toHaveBeenCalled()
+      app.unmount()
+    },
+  )
+  test('KeepAlive + Suspense: pending branch discarded before it resolves is unmounted', async () => {
+    const instances: any[] = []
+    const refCalls: any[] = []
+    const Async = {
+      async setup() {
+        instances.push(getCurrentInstance())
+        await new Promise(r => setTimeout(r))
+        return () => h('div', 'async')
+      },
+    }
+    const Sync = { render: () => h('div', 'sync') }
+    const view = shallowRef<any>(Async)
+    const root = nodeOps.createElement('div')
+    const App = {
+      render: () =>
+        h(KeepAlive, null, {
+          default: () =>
+            h(Suspense, null, {
+              default: h(view.value, {
+                ref:
+                  view.value === Async
+                    ? (i: any) => refCalls.push(i)
+                    : undefined,
+              }),
+              fallback: h('div', 'loading'),
+            }),
+        }),
+    }
+    render(h(App), root)
+    expect(serializeInner(root)).toBe('<div>loading</div>')
+    refCalls.length = 0
+
+    // switch away while the async root is still pending
+    view.value = Sync
+    await nextTick()
+    expect(serializeInner(root)).toBe('<div>sync</div>')
+    expect(instances[0].scope.active).toBe(false)
+    // the ref is released once, as for any unmounted component
+    expect(refCalls).toEqual([null])
+
+    view.value = Async
+    await nextTick()
+    await new Promise(r => setTimeout(r))
+    await nextTick()
+    expect(serializeInner(root)).toBe('<div>async</div>')
+
+    render(null, root)
+    expect(instances.length).toBe(2)
+    for (const instance of instances) {
+      expect(instance.scope.active).toBe(false)
+    }
+  })
+
+  test('KeepAlive discarded with a pending branch before it cached its child', async () => {
+    let instance: any
+    const Dep = {
+      async setup() {
+        await new Promise(r => setTimeout(r))
+        return () => h('span', 'dep')
+      },
+    }
+    const Inner = {
+      setup() {
+        instance = getCurrentInstance()
+        return () => h('div', 'inner')
+      },
+    }
+    const show = ref(true)
+    const root = nodeOps.createElement('div')
+    const App = {
+      render: () =>
+        h(Suspense, null, {
+          default: show.value
+            ? h('div', [
+                h(Dep),
+                h(KeepAlive, null, { default: () => h(Inner) }),
+              ])
+            : h('p', 'empty'),
+          fallback: h('p', 'loading'),
+        }),
+    }
+    render(h(App), root)
+    expect(serializeInner(root)).toBe('<p>loading</p>')
+    expect(instance.scope.active).toBe(true)
+    // the branch holding the KeepAlive is discarded before its mounted hook ran
+    show.value = false
+    await nextTick()
+    expect(serializeInner(root)).toBe('<p>empty</p>')
+    expect(instance.scope.active).toBe(false)
+  })
+
+  // a pending boundary unmounted before its timeout fires must not mount the
+  // fallback into a container that no longer belongs to it, nor unmount the
+  // already unmounted branch a second time.
+  test('should not mount fallback after the boundary is unmounted', async () => {
+    const toggleChild = ref(false)
+    const toggleSuspense = ref(true)
+    const beforeUnmount = vi.fn()
+    const unmounted = vi.fn()
+
+    const Child = {
+      setup() {
+        onBeforeUnmount(beforeUnmount)
+        onUnmounted(unmounted)
+        return () => h('div', 'child')
+      },
+    }
+
+    const Async = {
+      async setup() {
+        await new Promise(() => {})
+        return () => h('div', 'async')
+      },
+    }
+
+    const Comp = {
+      setup() {
+        return () =>
+          toggleSuspense.value
+            ? h(
+                Suspense,
+                { timeout: 20 },
+                {
+                  default: () => (toggleChild.value ? h(Async) : h(Child)),
+                  fallback: h('div', 'fallback'),
+                },
+              )
+            : h('div', 'gone')
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe(`<div>child</div>`)
+
+    // enter the pending state, arming the timeout
+    toggleChild.value = true
+    await nextTick()
+
+    // unmount the boundary before the timeout fires
+    toggleSuspense.value = false
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div>gone</div>`)
+
+    await new Promise(r => setTimeout(r, 50))
+
+    expect(serializeInner(root)).toBe(`<div>gone</div>`)
+    expect(beforeUnmount).toHaveBeenCalledTimes(1)
+    expect(unmounted).toHaveBeenCalledTimes(1)
+  })
+
+  test('clears the timeout when the boundary is unmounted while pending', async () => {
+    vi.useFakeTimers()
+    const Async = {
+      async setup() {
+        await new Promise(() => {})
+        return () => h('div', 'async')
+      },
+    }
+    const toggleChild = ref(false)
+    const toggleSuspense = ref(true)
+    const Comp = {
+      render: () =>
+        toggleSuspense.value
+          ? h(
+              Suspense,
+              { timeout: 100 },
+              {
+                default: () =>
+                  toggleChild.value ? h(Async) : h('div', 'sync'),
+                fallback: () => h('i', 'loading'),
+              },
+            )
+          : h('div', 'gone'),
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    toggleChild.value = true
+    await nextTick()
+    expect(vi.getTimerCount()).toBe(1)
+
+    toggleSuspense.value = false
+    await nextTick()
+    const timers = vi.getTimerCount()
+    vi.useRealTimers()
+    expect(timers).toBe(0)
+  })
+
+  test('keeps the timeout counting when the root is switched again while pending', async () => {
+    const A = { render: () => h('div', 'A') }
+    const B = {
+      async setup() {
+        await new Promise(() => {})
+        return () => h('div', 'B')
+      },
+    }
+    let resolveC!: () => void
+    const C = {
+      async setup() {
+        await new Promise<void>(r => (resolveC = r))
+        return () => h('div', 'C')
+      },
+    }
+    const page = shallowRef<any>(A)
+    const events: string[] = []
+    const Comp = {
+      render: () =>
+        h(
+          Suspense,
+          {
+            timeout: 100,
+            onFallback: () => events.push('fallback'),
+            onResolve: () => events.push('resolve'),
+          },
+          {
+            default: () => h(page.value),
+            fallback: () => h('i', 'loading'),
+          },
+        ),
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe('<div>A</div>')
+    events.length = 0
+
+    page.value = B
+    await nextTick()
+    await new Promise(r => setTimeout(r, 50))
+    page.value = C
+    await nextTick()
+    expect(serializeInner(root)).toBe('<div>A</div>')
+
+    // counted from the first switch, not restarted by the second
+    await new Promise(r => setTimeout(r, 80))
+    expect(serializeInner(root)).toBe('<i>loading</i>')
+    expect(events).toEqual(['fallback'])
+
+    resolveC()
+    await new Promise(r => setTimeout(r))
+    expect(serializeInner(root)).toBe('<div>C</div>')
+    expect(events).toEqual(['fallback', 'resolve'])
+  })
+
+  test('resolves after an async setup rejects without any error handler', async () => {
+    const Async = {
+      async setup() {
+        await Promise.reject(new Error('load failed'))
+        return () => h('div', 'async')
+      },
+    }
+    const Comp = {
+      setup() {
+        return () =>
+          h(Suspense, null, {
+            default: h(Async),
+            fallback: h('div', 'fallback'),
+          })
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe('<div>fallback</div>')
+
+    await new Promise(r => setTimeout(r))
+    expect(serializeInner(root)).toBe('<!---->')
+    expect(
+      'Unhandled error during execution of setup function',
+    ).toHaveBeenWarned()
+  })
+
+  test('should rerun an update waiting on an async root after the pending branch is discarded', async () => {
+    const msg = ref('a')
+    const showAsync = ref(false)
+
+    let resolveChild!: () => void
+    const AsyncChild = {
+      props: ['msg'],
+      async setup(props: { msg: string }) {
+        await new Promise<void>(r => (resolveChild = r))
+        return () => h('span', props.msg)
+      },
+    }
+
+    const Owner = {
+      setup() {
+        return () =>
+          showAsync.value ? h(AsyncChild, { msg: msg.value }) : h('i', 'sync')
+      },
+    }
+
+    const Pending = {
+      async setup() {
+        await new Promise(() => {})
+        return () => h('p', 'pending')
+      },
+    }
+
+    const page = shallowRef<ComponentOptions>(Owner)
+    const Comp = {
+      setup() {
+        return () => h('div', [h(Suspense, null, () => h(page.value))])
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe(`<div><i>sync</i></div>`)
+
+    // the root of Owner becomes an async component that has not resolved
+    showAsync.value = true
+    await nextTick()
+
+    page.value = Pending
+    await nextTick()
+    // Owner is retained while the boundary is pending, and updates
+    msg.value = 'b'
+    await nextTick()
+
+    // the async root resolves while the boundary is still pending
+    resolveChild()
+    await new Promise(r => setTimeout(r))
+    expect(serializeInner(root)).toBe(`<div><!----></div>`)
+
+    // switching back discards the pending branch
+    page.value = Owner
+    await nextTick()
+    await new Promise(r => setTimeout(r))
+    expect(serializeInner(root)).toBe(`<div><span>b</span></div>`)
+  })
+
+  test('should not rerun an update of a component discarded with the pending branch', async () => {
+    const msg = ref('a')
+    const renders = vi.fn()
+
+    let resolveChild!: () => void
+    const AsyncChild = {
+      props: ['msg'],
+      async setup(props: { msg: string }) {
+        await new Promise<void>(r => (resolveChild = r))
+        return () => h('span', props.msg)
+      },
+    }
+
+    const Owner = {
+      setup() {
+        return () => {
+          renders()
+          return h(AsyncChild, { msg: msg.value })
+        }
+      },
+    }
+
+    const Other = {
+      setup() {
+        return () => h('i', 'other')
+      },
+    }
+
+    const page = shallowRef<ComponentOptions>(Other)
+    const Comp = {
+      setup() {
+        return () => h('div', [h(Suspense, null, () => h(page.value))])
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+
+    page.value = Owner
+    await nextTick()
+    // Owner is in the pending branch and updates before its async root resolves
+    msg.value = 'b'
+    await nextTick()
+
+    // switching back discards the pending branch with Owner in it
+    page.value = Other
+    await nextTick()
+    expect(serializeInner(root)).toBe(`<div><i>other</i></div>`)
+
+    renders.mockClear()
+    resolveChild()
+    await new Promise(r => setTimeout(r))
+    expect(renders).not.toHaveBeenCalled()
+    expect(serializeInner(root)).toBe(`<div><i>other</i></div>`)
+  })
+
+  // #15878
+  test('patches a same-root update of a nested Suspense in retained content', async () => {
+    const deactivated = vi.fn()
+    const unmounted = vi.fn()
+    const Tab = {
+      props: ['count'],
+      setup(props: any) {
+        onDeactivated(deactivated)
+        onUnmounted(unmounted)
+        return () => h('div', `tab ${props.count}`)
+      },
+    }
+    const NextPage = defineAsyncComponent({
+      render: () => h('div', 'next page'),
+    })
+    const count = ref(0)
+    const Shell = {
+      render: () =>
+        h(KeepAlive, null, {
+          default: () =>
+            h(Suspense, null, {
+              default: h(Tab, { count: count.value }),
+            }),
+        }),
+    }
+    const page = ref('shell')
+    const Comp = {
+      render: () =>
+        h(Suspense, null, {
+          default: page.value === 'shell' ? h(Shell) : h(NextPage),
+        }),
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe('<div>tab 0</div>')
+
+    // the parent boundary waits for NextPage, Shell stays on screen
+    page.value = 'next'
+    await nextTick()
+    count.value++
+    await nextTick()
+    expect(serializeInner(root)).toBe('<div>tab 1</div>')
+
+    await Promise.all(deps)
+    await nextTick()
+    expect(serializeInner(root)).toBe('<div>next page</div>')
+    expect(deactivated).toHaveBeenCalledTimes(1)
+    expect(unmounted).toHaveBeenCalledTimes(1)
+  })
+
+  test('patches a root replacement in retained content once the parent is no longer pending', async () => {
+    const AsyncChild = {
+      async setup() {
+        await new Promise(() => {})
+        return () => h('b')
+      },
+    }
+    const PageB = {
+      async setup() {
+        await new Promise(() => {})
+        return () => h('div', 'page b')
+      },
+    }
+    const TabA = { render: () => h('i', 'a') }
+    const TabB = { render: () => h('i', 'b') }
+    const tab = shallowRef<ComponentOptions>(TabA)
+    let renders = 0
+    const PageA = {
+      props: ['show'],
+      render(this: any) {
+        if (++renders > 20) throw new Error('re-render loop')
+        return h('div', [
+          h(Suspense, null, { default: h(tab.value) }),
+          this.show ? h(AsyncChild) : null,
+        ])
+      },
+    }
+    const view = shallowRef<ComponentOptions>(PageA)
+    const show = ref(false)
+    const Comp = {
+      render: () =>
+        h(Suspense, null, { default: h(view.value, { show: show.value }) }),
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+
+    view.value = PageB
+    await nextTick()
+    // switching back while PageA mounts an async child leaves the parent
+    // with a dep but without a pending branch
+    view.value = PageA
+    show.value = true
+    await nextTick()
+
+    tab.value = TabB
+    await nextTick()
+    await nextTick()
+    expect(serializeInner(root)).toBe('<div><i>b</i><!----></div>')
+  })
+
+  test('patches a nested Suspense mounted into retained content while the parent is pending', async () => {
+    const show = ref(false)
+    const count = ref(0)
+    const Tab = {
+      props: ['count'],
+      setup: (props: any) => () => h('i', `tab ${props.count}`),
+    }
+    const PageA = {
+      setup: () => () =>
+        h('div', [
+          'a',
+          show.value
+            ? h(Suspense, null, { default: h(Tab, { count: count.value }) })
+            : null,
+        ]),
+    }
+    const PageB = {
+      async setup() {
+        await new Promise(() => {})
+        return () => h('div', 'page b')
+      },
+    }
+    const page = shallowRef<ComponentOptions>(PageA)
+    const Comp = {
+      setup: () => () => h(Suspense, null, { default: h(page.value) }),
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+
+    // the parent boundary waits for PageB, PageA stays on screen
+    page.value = PageB
+    await nextTick()
+    // PageA mounts a nested Suspense meanwhile, then updates it
+    show.value = true
+    await nextTick()
+    expect(serializeInner(root)).toBe('<div>a<i>tab 0</i></div>')
+    count.value++
+    await nextTick()
+    expect(serializeInner(root)).toBe('<div>a<i>tab 1</i></div>')
+  })
+
+  // #8678
+  test('does not mount the new route into a nested Suspense of the retained page', async () => {
+    const setups: string[] = []
+    const nested = () =>
+      h(RouterView, null, {
+        default: ({ Component }: any) => [
+          h(Suspense, null, { default: () => h(Component) }),
+        ],
+      })
+    const ParentSync = {
+      setup() {
+        setups.push('ParentSync')
+        return () => h('div', ['ParentSync', nested()])
+      },
+    }
+    const ParentAsync = {
+      async setup() {
+        setups.push('ParentAsync')
+        await new Promise(r => setTimeout(r))
+        return () => h('div', ['ParentAsync', nested()])
+      },
+    }
+    const ChildSync = {
+      setup() {
+        setups.push('ChildSync')
+        return () => h('i', 'ChildSync')
+      },
+    }
+    const ChildAsync = {
+      async setup() {
+        setups.push('ChildAsync')
+        await new Promise(r => setTimeout(r))
+        return () => h('i', 'ChildAsync')
+      },
+    }
+    const route = shallowRef<ComponentOptions[]>([ParentSync, ChildSync])
+    const Comp = {
+      setup() {
+        provide('route', route)
+        return () =>
+          h(RouterView, null, {
+            default: ({ Component }: any) => [
+              h(Suspense, null, { default: () => h(Component) }),
+            ],
+          })
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe('<div>ParentSync<i>ChildSync</i></div>')
+
+    route.value = [ParentAsync, ChildAsync]
+    await nextTick()
+    // ParentAsync resolves, then ChildAsync
+    await new Promise(r => setTimeout(r))
+    await new Promise(r => setTimeout(r))
+    expect(serializeInner(root)).toBe('<div>ParentAsync<i>ChildAsync</i></div>')
+    expect(setups).toEqual([
+      'ParentSync',
+      'ChildSync',
+      'ParentAsync',
+      'ChildAsync',
+    ])
+  })
+
+  test('renders nothing for a component whose async setup rejects', async () => {
+    const errors: unknown[] = []
+    // a template compiled apart from setup, like a dev SFC
+    const WithTemplate = {
+      async setup() {
+        await Promise.reject(new Error('load failed'))
+        return { comments: 'loaded' }
+      },
+      render(this: any) {
+        return h('div', `Comments: ${this.comments}`)
+      },
+    }
+    // a render function returned from setup, like an inline template
+    const Inline = {
+      async setup() {
+        await Promise.reject(new Error('load failed'))
+        return () => h('div', 'loaded')
+      },
+    }
+    const Comp = {
+      setup() {
+        onErrorCaptured(e => {
+          errors.push(e)
+          return false
+        })
+        return () =>
+          h(Suspense, null, {
+            default: h('div', [h(WithTemplate), h(Inline)]),
+            fallback: h('div', 'fallback'),
+          })
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe('<div>fallback</div>')
+
+    await new Promise(r => setTimeout(r))
+    expect(errors).toHaveLength(2)
+    expect(serializeInner(root)).toBe('<div><!----><!----></div>')
+  })
+
+  // #11037
+  test('out-in: a leave finishing after the boundary is unmounted does not bring the new branch back', async () => {
+    const mounted = vi.fn()
+    const Next = {
+      async setup() {
+        onMounted(mounted)
+        return () => h('div', 'next')
+      },
+    }
+    const page = shallowRef<ComponentOptions>({
+      render: () => h('div', 'first'),
+    })
+    const leaves: (() => void)[] = []
+    const App = {
+      render: () =>
+        h(
+          BaseTransition,
+          {
+            mode: 'out-in',
+            onLeave: (_: any, done: () => void) => {
+              leaves.push(done)
+            },
+          },
+          () => h(Suspense, null, { default: h(page.value) }),
+        ),
+    }
+    const root = nodeOps.createElement('div')
+    render(h(App), root)
+    expect(serializeInner(root)).toBe('<div>first</div>')
+
+    page.value = Next
+    await nextTick()
+    await new Promise(r => setTimeout(r))
+    // Next has settled: the first page is leaving, Next waits for afterLeave
+    expect(leaves.length).toBe(1)
+    expect(serializeInner(root)).toBe('<div>first</div>')
+
+    // the app is torn down while the leave is still running
+    render(null, root)
+    leaves[0]()
+    await nextTick()
+    expect(serializeInner(root)).toBe('')
+    expect(mounted).not.toHaveBeenCalled()
+  })
+
+  test('KeepAlive caches a resolved Suspense child before a synchronous toggle away', async () => {
+    const setup = vi.fn()
+    const unmounted = vi.fn()
+    const Entry = {
+      name: 'Entry',
+      setup() {
+        setup()
+        onUnmounted(unmounted)
+        return () => h('div', 'entry')
+      },
+    }
+    const Other = { render: () => h('div', 'other') }
+    const route = ref('page')
+    const show = ref(true)
+    const App = {
+      render: () =>
+        show.value
+          ? h(KeepAlive, null, {
+              default: () =>
+                h(Suspense, null, {
+                  default: h(route.value === 'page' ? Entry : Other),
+                }),
+            })
+          : null,
+    }
+    const root = nodeOps.createElement('div')
+    render(h(App), root)
+    expect(serializeInner(root)).toBe('<div>entry</div>')
+
+    // toggled before the next flush: the cache must already hold Entry
+    route.value = 'other'
+    await nextTick()
+    expect(serializeInner(root)).toBe('<div>other</div>')
+    expect(unmounted).not.toHaveBeenCalled()
+
+    route.value = 'page'
+    await nextTick()
+    expect(serializeInner(root)).toBe('<div>entry</div>')
+    expect(setup).toHaveBeenCalledTimes(1)
+
+    show.value = false
+    await nextTick()
+    expect(unmounted).toHaveBeenCalledTimes(1)
+  })
+
+  // #12435
+  test('enters a transition nested under an element of the pending branch on reveal', async () => {
+    const calls: string[] = []
+    const appear = (name: string, child: () => any) =>
+      h(
+        BaseTransition,
+        {
+          appear: true,
+          onBeforeAppear: () => calls.push(`${name} beforeAppear`),
+          onAppear: () => calls.push(`${name} appear`),
+          onBeforeEnter: () => calls.push(`${name} beforeEnter`),
+          onEnter: () => calls.push(`${name} enter`),
+        },
+        child,
+      )
+    let settle: () => void
+    const Async = {
+      async setup() {
+        await new Promise<void>(r => (settle = r))
+        return () => h('span')
+      },
+    }
+    const Page = {
+      setup() {
+        onMounted(() => calls.push('page mounted'))
+        return () => h('div', [appear('nested', () => h('p')), h(Async)])
+      },
+    }
+    const root = nodeOps.createElement('div')
+    render(
+      h(Suspense, null, { default: () => appear('root', () => h(Page)) }),
+      root,
+    )
+    expect(calls).toEqual([])
+
+    settle!()
+    await new Promise(r => setTimeout(r))
+    expect(serializeInner(root)).toBe('<div><p></p><span></span></div>')
+    // the whole branch appears, ahead of the buffered mounted hooks
+    expect(calls).toEqual([
+      'nested beforeAppear',
+      'root beforeAppear',
+      'nested appear',
+      'root appear',
+      'page mounted',
+    ])
+  })
+
+  test('enters a nested transition when an out-in leave reveals the pending branch', async () => {
+    const calls: string[] = []
+    let settle: () => void
+    const Next = {
+      async setup() {
+        await new Promise<void>(r => (settle = r))
+        return () =>
+          h('div', [
+            h(
+              BaseTransition,
+              {
+                appear: true,
+                onBeforeAppear: () => calls.push('beforeAppear'),
+                onAppear: () => calls.push('appear'),
+              },
+              () => h('p'),
+            ),
+          ])
+      },
+    }
+    const page = shallowRef<ComponentOptions>({
+      render: () => h('div', 'first'),
+    })
+    const leaves: (() => void)[] = []
+    const App = {
+      render: () =>
+        h(
+          BaseTransition,
+          {
+            mode: 'out-in',
+            onLeave: (_: any, done: () => void) => {
+              leaves.push(done)
+            },
+          },
+          () => h(Suspense, null, { default: h(page.value) }),
+        ),
+    }
+    const root = nodeOps.createElement('div')
+    render(h(App), root)
+    expect(serializeInner(root)).toBe('<div>first</div>')
+
+    page.value = Next
+    await nextTick()
+    settle!()
+    await new Promise(r => setTimeout(r))
+    // Next has settled: the first page is leaving, Next waits for afterLeave
+    expect(leaves.length).toBe(1)
+    expect(calls).toEqual([])
+
+    leaves[0]()
+    await nextTick()
+    expect(serializeInner(root)).toBe('<div><p></p></div>')
+    expect(calls).toEqual(['beforeAppear', 'appear'])
+  })
+
+  test('keeps the appear of a transition around a nested boundary inside a pending parent', async () => {
+    const calls: string[] = []
+    const settles: (() => void)[] = []
+    const asyncComp = (tag: string) => ({
+      async setup() {
+        await new Promise<void>(r => settles.push(r))
+        return () => h(tag)
+      },
+    })
+    const Inner = asyncComp('b')
+    const Outer = asyncComp('span')
+    const transition = (name: string, appear: boolean) =>
+      h(
+        BaseTransition,
+        {
+          appear,
+          onBeforeAppear: () => calls.push(`${name} beforeAppear`),
+          onAppear: () => calls.push(`${name} appear`),
+          onBeforeEnter: () => calls.push(`${name} beforeEnter`),
+          onEnter: () => calls.push(`${name} enter`),
+        },
+        () => h(Suspense, null, { default: () => h(Inner) }),
+      )
+    const App = {
+      render: () =>
+        h(Suspense, null, {
+          default: () =>
+            h('div', [transition('a', true), transition('b', false), h(Outer)]),
+        }),
+    }
+    const root = nodeOps.createElement('div')
+    render(h(App), root)
+    await nextTick()
+    expect(settles.length).toBe(3)
+
+    // the inner boundaries resolve while the outer one is still pending: the
+    // transitions are not mounted yet, their first enter is an appear
+    settles[0]()
+    settles[1]()
+    await new Promise(r => setTimeout(r))
+    expect(calls).toEqual(['a beforeAppear', 'a appear'])
+    // nothing more at the outer reveal
+    settles[2]()
+    await new Promise(r => setTimeout(r))
+    expect(serializeInner(root)).toBe('<div><b></b><b></b><span></span></div>')
+    expect(calls).toEqual(['a beforeAppear', 'a appear'])
+  })
+
+  test('does not enter a transition that became persisted while the branch was pending', async () => {
+    const calls: string[] = []
+    const persisted = ref(false)
+    let settle: () => void
+    const Async = {
+      async setup() {
+        await new Promise<void>(r => (settle = r))
+        return () => h('span')
+      },
+    }
+    const Page = {
+      render: () =>
+        h('div', [
+          h(
+            BaseTransition,
+            {
+              appear: true,
+              persisted: persisted.value,
+              onBeforeAppear: () => calls.push('beforeAppear'),
+              onAppear: () => calls.push('appear'),
+            },
+            () => h('p'),
+          ),
+          h(Async),
+        ]),
+    }
+    const root = nodeOps.createElement('div')
+    render(h(Suspense, null, { default: () => h(Page) }), root)
+
+    // a directive owns the enter of a persisted transition
+    persisted.value = true
+    await nextTick()
+    settle!()
+    await new Promise(r => setTimeout(r))
+    expect(serializeInner(root)).toBe('<div><p></p><span></span></div>')
+    expect(calls).toEqual([])
+  })
+
+  test('enters the pending branch with the transition hooks current at reveal', async () => {
+    const calls: string[] = []
+    const version = ref(1)
+    let settle: () => void
+    const Async = {
+      async setup() {
+        await new Promise<void>(r => (settle = r))
+        return () => h('span')
+      },
+    }
+    const Page = {
+      render: () => {
+        const v = version.value
+        return h('div', [
+          h(
+            BaseTransition,
+            {
+              appear: true,
+              onBeforeAppear: () => calls.push(`beforeAppear ${v}`),
+              onAppear: () => calls.push(`appear ${v}`),
+            },
+            () => h('p'),
+          ),
+          h(Async),
+        ])
+      },
+    }
+    const root = nodeOps.createElement('div')
+    render(h(Suspense, null, { default: () => h(Page) }), root)
+
+    // the pending branch re-renders with new hooks before it is revealed
+    version.value = 2
+    await nextTick()
+    settle!()
+    await new Promise(r => setTimeout(r))
+    expect(serializeInner(root)).toBe('<div><p></p><span></span></div>')
+    expect(calls).toEqual(['beforeAppear 2', 'appear 2'])
+  })
+
+  test('reveals a branch whose static elements lost their el to a block patch (prod)', async () => {
+    __DEV__ = false
+    try {
+      const calls: string[] = []
+      const count = ref(0)
+      let settle: () => void
+      const Async = {
+        async setup() {
+          await new Promise<void>(r => (settle = r))
+          return () => h('i')
+        },
+      }
+      // compiled shape: the section is static, its span and the components
+      // are the block's dynamic children
+      const Page = {
+        render: () => (
+          openBlock(),
+          createElementBlock('div', null, [
+            createElementVNode('section', null, [
+              createElementVNode(
+                'span',
+                null,
+                String(count.value),
+                PatchFlags.TEXT,
+              ),
+              createVNode(
+                BaseTransition,
+                {
+                  appear: true,
+                  onBeforeAppear: () => calls.push('beforeAppear'),
+                  onAppear: () => calls.push('appear'),
+                },
+                { default: () => h('p') },
+              ),
+            ]),
+            createVNode(Async),
+          ])
+        ),
+      }
+      const root = nodeOps.createElement('div')
+      render(h(Suspense, null, { default: () => h(Page) }), root)
+
+      // a block patch while pending: the new section vnode has no el
+      count.value++
+      await nextTick()
+      settle!()
+      await new Promise(r => setTimeout(r))
+      expect(serializeInner(root)).toBe(
+        '<div><section><span>1</span><p></p></section><i></i></div>',
+      )
+      expect(calls).toEqual(['beforeAppear', 'appear'])
+    } finally {
+      __DEV__ = true
+    }
+  })
+
+  describe('content root swapped to an unresolved async component', () => {
+    const Slow = {
+      async setup() {
+        await new Promise(() => {})
+        return () => h('b', 'slow')
+      },
+    }
+
+    test('the parent whose root is the boundary re-renders', async () => {
+      const showSlow = ref(false)
+      const theme = ref('light')
+      const Page = {
+        render: () => (showSlow.value ? h(Slow) : h('i', 'sync')),
+      }
+      const App = {
+        render: () =>
+          h(
+            Suspense,
+            { 'data-theme': theme.value },
+            { default: () => h(Page) },
+          ),
+      }
+      const root = nodeOps.createElement('div')
+      render(h(App), root)
+      expect(serializeInner(root)).toBe('<i>sync</i>')
+
+      showSlow.value = true
+      await nextTick()
+      expect(serializeInner(root)).toBe('<!---->')
+
+      theme.value = 'dark'
+      await nextTick()
+      expect(serializeInner(root)).toBe('<!---->')
+    })
+
+    test('the boundary reveals a new branch while the retained one has no el', async () => {
+      const showSlow = ref(false)
+      const Home = {
+        render: () => (showSlow.value ? h(Slow) : h('i', 'home')),
+      }
+      let settle: () => void
+      const Settings = {
+        async setup() {
+          await new Promise<void>(r => (settle = r))
+          return () => h('p', 'settings')
+        },
+      }
+      const page = shallowRef<ComponentOptions>(Home)
+      const App = {
+        render: () =>
+          h('div', [h(Suspense, null, { default: () => h(page.value) })]),
+      }
+      const root = nodeOps.createElement('div')
+      render(h(App), root)
+      expect(serializeInner(root)).toBe('<div><i>home</i></div>')
+
+      showSlow.value = true
+      await nextTick()
+      expect(serializeInner(root)).toBe('<div><!----></div>')
+
+      page.value = Settings
+      await nextTick()
+      settle!()
+      await new Promise(r => setTimeout(r))
+      expect(serializeInner(root)).toBe('<div><p>settings</p></div>')
+    })
+  })
+
+  describe('keyed boundary as the child of a transition', () => {
+    const A = { render: () => h('i', 'a') }
+    const B = { render: () => h('b', 'b') }
+
+    test('out-in mounts the new boundary after the old one has left', async () => {
+      const page = ref('a')
+      const leaves: (() => void)[] = []
+      const App = {
+        render: () =>
+          h(
+            BaseTransition,
+            {
+              mode: 'out-in',
+              onLeave: (_: any, done: () => void) => {
+                leaves.push(done)
+              },
+            },
+            () =>
+              h(
+                Suspense,
+                { key: page.value },
+                {
+                  default: h(page.value === 'a' ? A : B),
+                },
+              ),
+          ),
+      }
+      const root = nodeOps.createElement('div')
+      render(h(App), root)
+      expect(serializeInner(root)).toBe('<i>a</i>')
+
+      page.value = 'b'
+      await nextTick()
+      expect(leaves.length).toBe(1)
+      expect(serializeInner(root)).toBe('<i>a</i><!---->')
+
+      leaves[0]()
+      await nextTick()
+      expect(serializeInner(root)).toBe('<b>b</b>')
+    })
+
+    test('in-out keeps the old boundary until the new one has entered', async () => {
+      const page = ref('a')
+      const leaves: (() => void)[] = []
+      const enters: (() => void)[] = []
+      const App = {
+        render: () =>
+          h(
+            BaseTransition,
+            {
+              mode: 'in-out',
+              onEnter: (_: any, done: () => void) => {
+                enters.push(done)
+              },
+              onLeave: (_: any, done: () => void) => {
+                leaves.push(done)
+              },
+            },
+            () =>
+              h(
+                Suspense,
+                { key: page.value },
+                {
+                  default: h(page.value === 'a' ? A : B),
+                },
+              ),
+          ),
+      }
+      const root = nodeOps.createElement('div')
+      render(h(App), root)
+      expect(serializeInner(root)).toBe('<i>a</i>')
+
+      page.value = 'b'
+      await nextTick()
+      // the new boundary enters first, the old one waits
+      expect(serializeInner(root)).toBe('<i>a</i><b>b</b>')
+      expect(enters.length).toBe(1)
+      expect(leaves.length).toBe(0)
+
+      enters[0]()
+      await nextTick()
+      expect(leaves.length).toBe(1)
+      leaves[0]()
+      await nextTick()
+      expect(serializeInner(root)).toBe('<b>b</b>')
+    })
+
+    // the old boundary is still pending when the key changes: only what it
+    // shows takes part in the switch, its hidden branch leaves on its own
+    const pendingApp = (mode: 'out-in' | 'in-out', inFallback: boolean) => {
+      const Slow = {
+        async setup() {
+          await new Promise(() => {})
+          return () => h('u', 'slow')
+        },
+      }
+      const PageA = { render: () => h('i', 'a') }
+      // a page whose root is ready while a child is still loading
+      const Pending = { render: () => h('article', [h(Slow)]) }
+      const page = ref('a')
+      const content = shallowRef<ComponentOptions>(inFallback ? Pending : PageA)
+      const enters: (() => void)[] = []
+      const leaves: [string, () => void][] = []
+      const App = {
+        render: () =>
+          h(
+            BaseTransition,
+            {
+              mode,
+              onEnter: (_: any, done: () => void) => {
+                enters.push(done)
+              },
+              onLeave: (el: any, done: () => void) => {
+                leaves.push([el.tag, done])
+              },
+            },
+            () =>
+              h(
+                Suspense,
+                { key: page.value },
+                {
+                  default: h(page.value === 'a' ? content.value : B),
+                  fallback: h('p', 'loading'),
+                },
+              ),
+          ),
+      }
+      const root = nodeOps.createElement('div')
+      render(h(App), root)
+      return { root, page, content, Pending, enters, leaves }
+    }
+
+    test('out-in waits for the visible fallback of a pending boundary', async () => {
+      const { root, page, leaves } = pendingApp('out-in', true)
+      expect(serializeInner(root)).toBe('<p>loading</p>')
+
+      page.value = 'b'
+      await nextTick()
+      expect(serializeInner(root)).toBe('<p>loading</p><!---->')
+      expect(leaves.map(l => l[0])).toEqual(['p', 'article'])
+
+      // the hidden branch finishing its leave reveals nothing
+      leaves[1][1]()
+      await nextTick()
+      expect(serializeInner(root)).toBe('<p>loading</p><!---->')
+
+      leaves[0][1]()
+      await nextTick()
+      expect(serializeInner(root)).toBe('<b>b</b>')
+    })
+
+    test('in-out keeps the visible fallback of a pending boundary until the new one entered', async () => {
+      const { root, page, enters, leaves } = pendingApp('in-out', true)
+      expect(serializeInner(root)).toBe('<p>loading</p>')
+
+      page.value = 'b'
+      await nextTick()
+      expect(serializeInner(root)).toBe('<p>loading</p><b>b</b>')
+      // the hidden branch left at once, the fallback waits
+      expect(leaves.map(l => l[0])).toEqual(['article'])
+
+      enters[0]()
+      await nextTick()
+      expect(leaves.map(l => l[0])).toEqual(['article', 'p'])
+      leaves[1][1]()
+      await nextTick()
+      expect(serializeInner(root)).toBe('<b>b</b>')
+    })
+
+    test('out-in waits for the retained content of a pending boundary', async () => {
+      const { root, page, content, Pending, leaves } = pendingApp(
+        'out-in',
+        false,
+      )
+      expect(serializeInner(root)).toBe('<i>a</i>')
+      // the boundary goes pending again, keeping its content on screen
+      content.value = Pending
+      await nextTick()
+      expect(serializeInner(root)).toBe('<i>a</i>')
+
+      page.value = 'b'
+      await nextTick()
+      expect(leaves.map(l => l[0])).toEqual(['i', 'article'])
+      leaves[1][1]()
+      await nextTick()
+      expect(serializeInner(root)).toBe('<i>a</i><!---->')
+
+      leaves[0][1]()
+      await nextTick()
+      expect(serializeInner(root)).toBe('<b>b</b>')
+    })
+
+    test('in-out keeps the retained content of a pending boundary until the new one entered', async () => {
+      const { root, page, content, Pending, enters, leaves } = pendingApp(
+        'in-out',
+        false,
+      )
+      content.value = Pending
+      await nextTick()
+      expect(serializeInner(root)).toBe('<i>a</i>')
+
+      page.value = 'b'
+      await nextTick()
+      expect(serializeInner(root)).toBe('<i>a</i><b>b</b>')
+      expect(leaves.map(l => l[0])).toEqual(['article'])
+
+      enters[0]()
+      await nextTick()
+      expect(leaves.map(l => l[0])).toEqual(['article', 'i'])
+      leaves[1][1]()
+      await nextTick()
+      expect(serializeInner(root)).toBe('<b>b</b>')
+    })
+  })
+
+  test('does not mount the new route into a nested boundary of the retained page that shows its fallback', async () => {
+    const setups: string[] = []
+    const nested = () =>
+      h(RouterView, null, {
+        default: ({ Component }: any) => [
+          h(Suspense, null, { default: () => h(Component) }),
+        ],
+      })
+    const ParentSync = {
+      setup() {
+        setups.push('ParentSync')
+        return () => h('div', ['ParentSync', nested()])
+      },
+    }
+    let settle: () => void
+    const ParentAsync = {
+      async setup() {
+        setups.push('ParentAsync')
+        await new Promise<void>(r => (settle = r))
+        return () => h('div', ['ParentAsync', nested()])
+      },
+    }
+    // the child route of the old page is still loading
+    const ChildSlow = {
+      async setup() {
+        setups.push('ChildSlow')
+        await new Promise(() => {})
+        return () => h('i', 'ChildSlow')
+      },
+    }
+    const ChildAsync = {
+      async setup() {
+        setups.push('ChildAsync')
+        await Promise.resolve()
+        return () => h('i', 'ChildAsync')
+      },
+    }
+    const route = shallowRef<ComponentOptions[]>([ParentSync, ChildSlow])
+    const Comp = {
+      setup() {
+        provide('route', route)
+        return () =>
+          h(RouterView, null, {
+            default: ({ Component }: any) => [
+              h(Suspense, null, { default: () => h(Component) }),
+            ],
+          })
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe('<div>ParentSync<!----></div>')
+
+    // both route levels change while the old page's nested boundary is in
+    // its fallback state: the new child must not mount into the old page
+    route.value = [ParentAsync, ChildAsync]
+    await nextTick()
+    await new Promise(r => setTimeout(r, 10))
+    expect(serializeInner(root)).toBe('<div>ParentSync<!----></div>')
+    expect(setups).toEqual(['ParentSync', 'ChildSlow', 'ParentAsync'])
+
+    settle!()
+    await new Promise(r => setTimeout(r, 10))
+    expect(serializeInner(root)).toBe('<div>ParentAsync<i>ChildAsync</i></div>')
+    expect(setups).toEqual([
+      'ParentSync',
+      'ChildSlow',
+      'ParentAsync',
+      'ChildAsync',
+    ])
+  })
+
+  test('patches the props of the pending child in a nested boundary of the retained page', async () => {
+    const setups: string[] = []
+    const msg = shallowRef('a')
+    const nested = () =>
+      h(RouterView, null, {
+        default: ({ Component }: any) => [
+          h(Suspense, null, {
+            default: () => h(Component, { msg: msg.value }),
+          }),
+        ],
+      })
+    const ParentSync = {
+      setup() {
+        setups.push('ParentSync')
+        return () => h('div', ['ParentSync', nested()])
+      },
+    }
+    let settle: () => void
+    const ParentAsync = {
+      async setup() {
+        setups.push('ParentAsync')
+        await new Promise<void>(r => (settle = r))
+        return () => h('div', ['ParentAsync', nested()])
+      },
+    }
+    let settleChild: () => void
+    const Child = {
+      props: ['msg'],
+      async setup(props: any) {
+        setups.push('Child')
+        await new Promise<void>(r => (settleChild = r))
+        return () => h('i', `Child ${props.msg}`)
+      },
+    }
+    const route = shallowRef<ComponentOptions[]>([ParentSync, Child])
+    const Comp = {
+      setup() {
+        provide('route', route)
+        return () =>
+          h(RouterView, null, {
+            default: ({ Component }: any) => [
+              h(Suspense, null, { default: () => h(Component) }),
+            ],
+          })
+      },
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe('<div>ParentSync<!----></div>')
+
+    // the page changes while the old page's child route is still loading: the
+    // same child with new props is an update of the pending child, not a
+    // root replacement, so it goes through
+    route.value = [ParentAsync, Child]
+    msg.value = 'b'
+    await nextTick()
+    expect(setups).toEqual(['ParentSync', 'Child', 'ParentAsync'])
+
+    settleChild!()
+    await new Promise(r => setTimeout(r))
+    expect(serializeInner(root)).toBe('<div>ParentSync<i>Child b</i></div>')
+
+    settle!()
+    await new Promise(r => setTimeout(r))
+    expect(serializeInner(root)).toBe('<div>ParentAsync<!----></div>')
+    settleChild!()
+    await new Promise(r => setTimeout(r))
+    expect(serializeInner(root)).toBe('<div>ParentAsync<i>Child b</i></div>')
+    expect(setups).toEqual(['ParentSync', 'Child', 'ParentAsync', 'Child'])
+  })
+})

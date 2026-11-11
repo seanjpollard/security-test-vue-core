@@ -1,0 +1,16 @@
+{
+  // Use the project's typescript version
+  "js/ts.tsdk.path": "node_modules/typescript/lib",
+  "cSpell.enabledLanguageIds": ["markdown", "plaintext", "text", "yml"],
+  // Use prettier to format TypeScript, JavaScript and JSON files
+  "[typescript]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "[javascript]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "[json]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "editor.formatOnSave": true
+}

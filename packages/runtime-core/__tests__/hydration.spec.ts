@@ -1,0 +1,4543 @@
+/**
+ * @vitest-environment jsdom
+ */
+
+import {
+  type Component,
+  type ComponentPublicInstance,
+  Fragment,
+  type ObjectDirective,
+  Suspense,
+  Teleport,
+  Transition,
+  type VNode,
+  type VNodeChild,
+  createBlock,
+  createCommentVNode,
+  createElementBlock,
+  createElementVNode,
+  createSSRApp,
+  createStaticVNode,
+  createTextVNode,
+  createVNode,
+  defineAsyncComponent,
+  defineComponent,
+  getCurrentInstance,
+  h,
+  hydrateOnVisible,
+  nextTick,
+  onMounted,
+  onServerPrefetch,
+  openBlock,
+  reactive,
+  ref,
+  registerRuntimeCompiler,
+  renderSlot,
+  shallowRef,
+  useCssVars,
+  vModelCheckbox,
+  vShow,
+  withAsyncContext,
+  withCtx,
+  withDirectives,
+} from '@vue/runtime-dom'
+import * as runtimeDom from '@vue/runtime-dom'
+import type { HMRRuntime } from '../src/hmr'
+import type { InternalRenderFunction } from '../src/component'
+import { type SSRContext, renderToString } from '@vue/server-renderer'
+import { type CompilerOptions, compile } from '@vue/compiler-dom'
+import { PatchFlags, normalizeStyle } from '@vue/shared'
+import { vShowOriginalDisplay } from '../../runtime-dom/src/directives/vShow'
+
+declare var __VUE_HMR_RUNTIME__: HMRRuntime
+const { createRecord, reload } = __VUE_HMR_RUNTIME__
+
+registerRuntimeCompiler(compileToFunction)
+
+function compileToFunction(template: string, options?: CompilerOptions) {
+  const { code } = compile(
+    template,
+    Object.assign({ hoistStatic: true }, options),
+  )
+  const render = new Function('Vue', code)(runtimeDom) as InternalRenderFunction
+  render._rc = true
+  return render
+}
+
+function mountWithHydration(html: string, render: () => any) {
+  const container = document.createElement('div')
+  container.innerHTML = html
+  const app = createSSRApp({
+    render,
+  })
+  return {
+    vnode: app.mount(container).$.subTree as VNode<Node, Element> & {
+      el: Element
+    },
+    container,
+  }
+}
+
+const triggerEvent = (type: string, el: Element) => {
+  const event = new Event(type)
+  el.dispatchEvent(event)
+}
+
+type SuspenseGate = (name?: string) => Promise<void>
+
+/**
+ * The Suspense hydration tests below need the app twice: rendered on the server
+ * with every async gate already resolved, then hydrated over that markup with
+ * the gates held open, so the boundary stays pending for as long as the test
+ * needs. `makeApp` is called once per side; whatever it returns next to `App`
+ * (refs, spies) is the client side's, and `release(name)` settles one gate.
+ */
+async function hydrateSuspenseApp<S extends object>(
+  makeApp: (gate: SuspenseGate) => { App: Component } & S,
+): Promise<
+  {
+    container: HTMLElement
+    ssrHtml: string
+    release: (name?: string) => void
+  } & S
+> {
+  const ssrHtml = await renderToString(h(makeApp(() => Promise.resolve()).App))
+  const container = document.createElement('div')
+  container.innerHTML = ssrHtml
+
+  const held: Record<string, Promise<void>> = {}
+  const release: Record<string, () => void> = {}
+  const client = makeApp(
+    (name = 'default') =>
+      (held[name] ||= new Promise<void>(r => (release[name] = r))),
+  )
+  createSSRApp(client.App).mount(container)
+  await nextTick()
+  return {
+    ...client,
+    container,
+    ssrHtml,
+    release: (name = 'default') => release[name](),
+  }
+}
+
+/**
+ * The shape that keeps a root <Suspense> pending for a whole hydration: a
+ * nested suspensible boundary inside it holding the content the test toggles.
+ * Only the inner view tracks that state, so an update patches the nested
+ * boundary directly - the shape a router-driven <RouterView> takes.
+ */
+function nestedSuspenseApp(opts: {
+  content: () => VNodeChild
+  onRootResolve?: () => void
+  onNestedResolve?: () => void
+  // props for a <Transition> wrapped around the nested boundary
+  transition?: Record<string, unknown>
+}): Component {
+  const View = defineComponent({
+    setup() {
+      const inner = () =>
+        h(
+          Suspense,
+          { suspensible: true, onResolve: opts.onNestedResolve },
+          { default: opts.content },
+        )
+      return () =>
+        opts.transition ? h(Transition, opts.transition, inner) : inner()
+    },
+  })
+  return defineComponent({
+    setup: () => () =>
+      h(Suspense, { onResolve: opts.onRootResolve }, () => h(View)),
+  })
+}
+
+describe('SSR hydration', () => {
+  beforeEach(() => {
+    document.body.innerHTML = ''
+  })
+
+  test('text', async () => {
+    const msg = ref('foo')
+    const { vnode, container } = mountWithHydration('foo', () => msg.value)
+    expect(vnode.el).toBe(container.firstChild)
+    expect(container.textContent).toBe('foo')
+    msg.value = 'bar'
+    await nextTick()
+    expect(container.textContent).toBe('bar')
+  })
+
+  test('empty text', async () => {
+    const { container } = mountWithHydration('<div></div>', () =>
+      h('div', createTextVNode('')),
+    )
+    expect(container.textContent).toBe('')
+    expect(`Hydration children mismatch in <div>`).not.toHaveBeenWarned()
+  })
+
+  test('text w/ newlines', async () => {
+    mountWithHydration('<div>1\n2\n3</div>', () => h('div', '1\r\n2\r3'))
+    expect(`Hydration text mismatch`).not.toHaveBeenWarned()
+  })
+
+  test('comment', () => {
+    const { vnode, container } = mountWithHydration('<!---->', () => null)
+    expect(vnode.el).toBe(container.firstChild)
+    expect(vnode.el.nodeType).toBe(8) // comment
+  })
+
+  test('static', () => {
+    const html = '<div><span>hello</span></div>'
+    const { vnode, container } = mountWithHydration(html, () =>
+      createStaticVNode('', 1),
+    )
+    expect(vnode.el).toBe(container.firstChild)
+    expect(vnode.el.outerHTML).toBe(html)
+    expect(vnode.anchor).toBe(container.firstChild)
+    expect(vnode.children).toBe(html)
+  })
+
+  test('static (multiple elements)', () => {
+    const staticContent = '<div></div><span>hello</span>'
+    const html = `<div><div>hi</div>` + staticContent + `<div>ho</div></div>`
+
+    const n1 = h('div', 'hi')
+    const s = createStaticVNode('', 2)
+    const n2 = h('div', 'ho')
+
+    const { container } = mountWithHydration(html, () => h('div', [n1, s, n2]))
+
+    const div = container.firstChild!
+
+    expect(n1.el).toBe(div.firstChild)
+    expect(n2.el).toBe(div.lastChild)
+    expect(s.el).toBe(div.childNodes[1])
+    expect(s.anchor).toBe(div.childNodes[2])
+    expect(s.children).toBe(staticContent)
+  })
+
+  // #6008
+  test('static (with text node as starting node)', () => {
+    const html = ` A <span>foo</span> B`
+    const { vnode, container } = mountWithHydration(html, () =>
+      createStaticVNode(` A <span>foo</span> B`, 3),
+    )
+    expect(vnode.el).toBe(container.firstChild)
+    expect(vnode.anchor).toBe(container.lastChild)
+    expect(`Hydration node mismatch`).not.toHaveBeenWarned()
+  })
+
+  test('static with content adoption', () => {
+    const html = ` A <span>foo</span> B`
+    const { vnode, container } = mountWithHydration(html, () =>
+      createStaticVNode(``, 3),
+    )
+    expect(vnode.el).toBe(container.firstChild)
+    expect(vnode.anchor).toBe(container.lastChild)
+    expect(vnode.children).toBe(html)
+    expect(`Hydration node mismatch`).not.toHaveBeenWarned()
+  })
+
+  test('element with text children', async () => {
+    const msg = ref('foo')
+    const { vnode, container } = mountWithHydration(
+      '<div class="foo">foo</div>',
+      () => h('div', { class: msg.value }, msg.value),
+    )
+    expect(vnode.el).toBe(container.firstChild)
+    expect(container.firstChild!.textContent).toBe('foo')
+    msg.value = 'bar'
+    await nextTick()
+    expect(container.innerHTML).toBe(`<div class="bar">bar</div>`)
+  })
+
+  // #7285
+  test('element with multiple continuous text vnodes', async () => {
+    // should no mismatch warning
+    const { container } = mountWithHydration('<div>foo0o</div>', () =>
+      h('div', ['fo', createTextVNode('o'), 0, 'o']),
+    )
+    expect(container.textContent).toBe('foo0o')
+  })
+
+  test('element with elements children', async () => {
+    const msg = ref('foo')
+    const fn = vi.fn()
+    const { vnode, container } = mountWithHydration(
+      '<div><span>foo</span><span class="foo"></span></div>',
+      () =>
+        h('div', [
+          h('span', msg.value),
+          h('span', { class: msg.value, onClick: fn }),
+        ]),
+    )
+    expect(vnode.el).toBe(container.firstChild)
+    expect((vnode.children as VNode[])[0].el).toBe(
+      container.firstChild!.childNodes[0],
+    )
+    expect((vnode.children as VNode[])[1].el).toBe(
+      container.firstChild!.childNodes[1],
+    )
+
+    // event handler
+    triggerEvent('click', vnode.el.querySelector('.foo')!)
+    expect(fn).toHaveBeenCalled()
+
+    msg.value = 'bar'
+    await nextTick()
+    expect(vnode.el.innerHTML).toBe(`<span>bar</span><span class="bar"></span>`)
+  })
+
+  test('element with ref', () => {
+    const el = ref()
+    const { vnode, container } = mountWithHydration('<div></div>', () =>
+      h('div', { ref: el }),
+    )
+    expect(vnode.el).toBe(container.firstChild)
+    expect(el.value).toBe(vnode.el)
+  })
+
+  test('Fragment', async () => {
+    const msg = ref('foo')
+    const fn = vi.fn()
+    const { vnode, container } = mountWithHydration(
+      '<div><!--[--><span>foo</span><!--[--><span class="foo"></span><!--]--><!--]--></div>',
+      () =>
+        h('div', [
+          [
+            h('span', msg.value),
+            [h('span', { class: msg.value, onClick: fn })],
+          ],
+        ]),
+    )
+    expect(vnode.el).toBe(container.firstChild)
+
+    expect(vnode.el.innerHTML).toBe(
+      `<!--[--><span>foo</span><!--[--><span class="foo"></span><!--]--><!--]-->`,
+    )
+
+    // start fragment 1
+    const fragment1 = (vnode.children as VNode[])[0]
+    expect(fragment1.el).toBe(vnode.el.childNodes[0])
+    const fragment1Children = fragment1.children as VNode[]
+
+    // first <span>
+    expect(fragment1Children[0].el!.tagName).toBe('SPAN')
+    expect(fragment1Children[0].el).toBe(vnode.el.childNodes[1])
+
+    // start fragment 2
+    const fragment2 = fragment1Children[1]
+    expect(fragment2.el).toBe(vnode.el.childNodes[2])
+    const fragment2Children = fragment2.children as VNode[]
+
+    // second <span>
+    expect(fragment2Children[0].el!.tagName).toBe('SPAN')
+    expect(fragment2Children[0].el).toBe(vnode.el.childNodes[3])
+
+    // end fragment 2
+    expect(fragment2.anchor).toBe(vnode.el.childNodes[4])
+
+    // end fragment 1
+    expect(fragment1.anchor).toBe(vnode.el.childNodes[5])
+
+    // event handler
+    triggerEvent('click', vnode.el.querySelector('.foo')!)
+    expect(fn).toHaveBeenCalled()
+
+    msg.value = 'bar'
+    await nextTick()
+    expect(vnode.el.innerHTML).toBe(
+      `<!--[--><span>bar</span><!--[--><span class="bar"></span><!--]--><!--]-->`,
+    )
+  })
+
+  // #7285
+  test('Fragment (multiple continuous text vnodes)', async () => {
+    // should no mismatch warning
+    const { container } = mountWithHydration('<!--[-->fooo<!--]-->', () => [
+      'fo',
+      createTextVNode('o'),
+      'o',
+    ])
+    expect(container.textContent).toBe('fooo')
+  })
+
+  test('Teleport', async () => {
+    const msg = ref('foo')
+    const fn = vi.fn()
+    const teleportContainer = document.createElement('div')
+    teleportContainer.id = 'teleport'
+    teleportContainer.innerHTML = `<!--teleport start anchor--><span>foo</span><span class="foo"></span><!--teleport anchor-->`
+    document.body.appendChild(teleportContainer)
+
+    const { vnode, container } = mountWithHydration(
+      '<!--teleport start--><!--teleport end-->',
+      () =>
+        h(Teleport, { to: '#teleport' }, [
+          h('span', msg.value),
+          h('span', { class: msg.value, onClick: fn }),
+        ]),
+    )
+
+    expect(vnode.el).toBe(container.firstChild)
+    expect(vnode.anchor).toBe(container.lastChild)
+
+    expect(vnode.target).toBe(teleportContainer)
+    expect(vnode.targetStart).toBe(teleportContainer.childNodes[0])
+    expect((vnode.children as VNode[])[0].el).toBe(
+      teleportContainer.childNodes[1],
+    )
+    expect((vnode.children as VNode[])[1].el).toBe(
+      teleportContainer.childNodes[2],
+    )
+    expect(vnode.targetAnchor).toBe(teleportContainer.childNodes[3])
+
+    // event handler
+    triggerEvent('click', teleportContainer.querySelector('.foo')!)
+    expect(fn).toHaveBeenCalled()
+
+    msg.value = 'bar'
+    await nextTick()
+    expect(teleportContainer.innerHTML).toBe(
+      `<!--teleport start anchor--><span>bar</span><span class="bar"></span><!--teleport anchor-->`,
+    )
+  })
+
+  test('Teleport (multiple + integration)', async () => {
+    const msg = ref('foo')
+    const fn1 = vi.fn()
+    const fn2 = vi.fn()
+
+    const Comp = () => [
+      h(Teleport, { to: '#teleport2' }, [
+        h('span', msg.value),
+        h('span', { class: msg.value, onClick: fn1 }),
+      ]),
+      h(Teleport, { to: '#teleport2' }, [
+        h('span', msg.value + '2'),
+        h('span', { class: msg.value + '2', onClick: fn2 }),
+      ]),
+    ]
+
+    const teleportContainer = document.createElement('div')
+    teleportContainer.id = 'teleport2'
+    const ctx: SSRContext = {}
+    const mainHtml = await renderToString(h(Comp), ctx)
+    expect(mainHtml).toMatchInlineSnapshot(
+      `"<!--[--><!--teleport start--><!--teleport end--><!--teleport start--><!--teleport end--><!--]-->"`,
+    )
+
+    const teleportHtml = ctx.teleports!['#teleport2']
+    expect(teleportHtml).toMatchInlineSnapshot(
+      `"<!--teleport start anchor--><span>foo</span><span class="foo"></span><!--teleport anchor--><!--teleport start anchor--><span>foo2</span><span class="foo2"></span><!--teleport anchor-->"`,
+    )
+
+    teleportContainer.innerHTML = teleportHtml
+    document.body.appendChild(teleportContainer)
+
+    const { vnode, container } = mountWithHydration(mainHtml, Comp)
+    expect(vnode.el).toBe(container.firstChild)
+    const teleportVnode1 = (vnode.children as VNode[])[0]
+    const teleportVnode2 = (vnode.children as VNode[])[1]
+    expect(teleportVnode1.el).toBe(container.childNodes[1])
+    expect(teleportVnode1.anchor).toBe(container.childNodes[2])
+    expect(teleportVnode2.el).toBe(container.childNodes[3])
+    expect(teleportVnode2.anchor).toBe(container.childNodes[4])
+
+    expect(teleportVnode1.target).toBe(teleportContainer)
+    expect(teleportVnode1.targetStart).toBe(teleportContainer.childNodes[0])
+    expect((teleportVnode1 as any).children[0].el).toBe(
+      teleportContainer.childNodes[1],
+    )
+    expect(teleportVnode1.targetAnchor).toBe(teleportContainer.childNodes[3])
+
+    expect(teleportVnode2.target).toBe(teleportContainer)
+    expect(teleportVnode2.targetStart).toBe(teleportContainer.childNodes[4])
+    expect((teleportVnode2 as any).children[0].el).toBe(
+      teleportContainer.childNodes[5],
+    )
+    expect(teleportVnode2.targetAnchor).toBe(teleportContainer.childNodes[7])
+
+    // // event handler
+    triggerEvent('click', teleportContainer.querySelector('.foo')!)
+    expect(fn1).toHaveBeenCalled()
+
+    triggerEvent('click', teleportContainer.querySelector('.foo2')!)
+    expect(fn2).toHaveBeenCalled()
+
+    msg.value = 'bar'
+    await nextTick()
+    expect(teleportContainer.innerHTML).toMatchInlineSnapshot(
+      `"<!--teleport start anchor--><span>bar</span><span class="bar"></span><!--teleport anchor--><!--teleport start anchor--><span>bar2</span><span class="bar2"></span><!--teleport anchor-->"`,
+    )
+  })
+
+  test('Teleport (disabled)', async () => {
+    const msg = ref('foo')
+    const fn1 = vi.fn()
+    const fn2 = vi.fn()
+
+    const Comp = () => [
+      h('div', 'foo'),
+      h(Teleport, { to: '#teleport3', disabled: true }, [
+        h('span', msg.value),
+        h('span', { class: msg.value, onClick: fn1 }),
+      ]),
+      h('div', { class: msg.value + '2', onClick: fn2 }, 'bar'),
+    ]
+
+    const teleportContainer = document.createElement('div')
+    teleportContainer.id = 'teleport3'
+    const ctx: SSRContext = {}
+    const mainHtml = await renderToString(h(Comp), ctx)
+    expect(mainHtml).toMatchInlineSnapshot(
+      `"<!--[--><div>foo</div><!--teleport start--><span>foo</span><span class="foo"></span><!--teleport end--><div class="foo2">bar</div><!--]-->"`,
+    )
+
+    const teleportHtml = ctx.teleports!['#teleport3']
+    expect(teleportHtml).toMatchInlineSnapshot(
+      `"<!--teleport start anchor--><!--teleport anchor-->"`,
+    )
+
+    teleportContainer.innerHTML = teleportHtml
+    document.body.appendChild(teleportContainer)
+
+    const { vnode, container } = mountWithHydration(mainHtml, Comp)
+    expect(vnode.el).toBe(container.firstChild)
+    const children = vnode.children as VNode[]
+
+    expect(children[0].el).toBe(container.childNodes[1])
+
+    const teleportVnode = children[1]
+    expect(teleportVnode.el).toBe(container.childNodes[2])
+    expect((teleportVnode.children as VNode[])[0].el).toBe(
+      container.childNodes[3],
+    )
+    expect((teleportVnode.children as VNode[])[1].el).toBe(
+      container.childNodes[4],
+    )
+    expect(teleportVnode.anchor).toBe(container.childNodes[5])
+    expect(children[2].el).toBe(container.childNodes[6])
+
+    expect(teleportVnode.target).toBe(teleportContainer)
+    expect(teleportVnode.targetStart).toBe(teleportContainer.childNodes[0])
+    expect(teleportVnode.targetAnchor).toBe(teleportContainer.childNodes[1])
+
+    // // event handler
+    triggerEvent('click', container.querySelector('.foo')!)
+    expect(fn1).toHaveBeenCalled()
+
+    triggerEvent('click', container.querySelector('.foo2')!)
+    expect(fn2).toHaveBeenCalled()
+
+    msg.value = 'bar'
+    await nextTick()
+    expect(container.innerHTML).toMatchInlineSnapshot(
+      `"<!--[--><div>foo</div><!--teleport start--><span>bar</span><span class="bar"></span><!--teleport end--><div class="bar2">bar</div><!--]-->"`,
+    )
+  })
+
+  // #6152
+  test('Teleport (disabled + as component root)', () => {
+    const { container } = mountWithHydration(
+      '<!--[--><div>Parent fragment</div><!--teleport start--><div>Teleport content</div><!--teleport end--><!--]-->',
+      () => [
+        h('div', 'Parent fragment'),
+        h(() =>
+          h(Teleport, { to: 'body', disabled: true }, [
+            h('div', 'Teleport content'),
+          ]),
+        ),
+      ],
+    )
+    expect(document.body.innerHTML).toBe('')
+    expect(container.innerHTML).toBe(
+      '<!--[--><div>Parent fragment</div><!--teleport start--><div>Teleport content</div><!--teleport end--><!--]-->',
+    )
+    expect(
+      `Hydration completed but contains mismatches.`,
+    ).not.toHaveBeenWarned()
+  })
+
+  test('Teleport (as component root)', () => {
+    const teleportContainer = document.createElement('div')
+    teleportContainer.id = 'teleport4'
+    teleportContainer.innerHTML = `<!--teleport start anchor-->hello<!--teleport anchor-->`
+    document.body.appendChild(teleportContainer)
+
+    const wrapper = {
+      render() {
+        return h(Teleport, { to: '#teleport4' }, ['hello'])
+      },
+    }
+
+    const { vnode, container } = mountWithHydration(
+      '<div><!--teleport start--><!--teleport end--><div></div></div>',
+      () => h('div', [h(wrapper), h('div')]),
+    )
+    expect(vnode.el).toBe(container.firstChild)
+    // component el
+    const wrapperVNode = (vnode as any).children[0]
+    const tpStart = container.firstChild?.firstChild
+    const tpEnd = tpStart?.nextSibling
+    expect(wrapperVNode.el).toBe(tpStart)
+    expect(wrapperVNode.component.subTree.el).toBe(tpStart)
+    expect(wrapperVNode.component.subTree.anchor).toBe(tpEnd)
+    // next node hydrate properly
+    const nextVNode = (vnode as any).children[1]
+    expect(nextVNode.el).toBe(container.firstChild?.lastChild)
+  })
+
+  test('Teleport (nested)', () => {
+    const teleportContainer = document.createElement('div')
+    teleportContainer.id = 'teleport5'
+    teleportContainer.innerHTML = `<!--teleport start anchor--><div><!--teleport start--><!--teleport end--></div><!--teleport anchor--><!--teleport start anchor--><div>child</div><!--teleport anchor-->`
+    document.body.appendChild(teleportContainer)
+
+    const { vnode, container } = mountWithHydration(
+      '<!--teleport start--><!--teleport end-->',
+      () =>
+        h(Teleport, { to: '#teleport5' }, [
+          h('div', [h(Teleport, { to: '#teleport5' }, [h('div', 'child')])]),
+        ]),
+    )
+
+    expect(vnode.el).toBe(container.firstChild)
+    expect(vnode.anchor).toBe(container.lastChild)
+
+    const childDivVNode = (vnode as any).children[0]
+    const div = teleportContainer.childNodes[1]
+    expect(childDivVNode.el).toBe(div)
+    expect(vnode.targetAnchor).toBe(div?.nextSibling)
+
+    const childTeleportVNode = childDivVNode.children[0]
+    expect(childTeleportVNode.el).toBe(div?.firstChild)
+    expect(childTeleportVNode.anchor).toBe(div?.lastChild)
+
+    expect(childTeleportVNode.targetAnchor).toBe(teleportContainer.lastChild)
+    expect(childTeleportVNode.children[0].el).toBe(
+      teleportContainer.lastChild?.previousSibling,
+    )
+  })
+
+  test('with data-allow-mismatch component when using onServerPrefetch', async () => {
+    const Comp = {
+      template: `
+        <div>Comp2</div>
+      `,
+    }
+    let foo: any
+    const App = {
+      setup() {
+        const flag = ref(true)
+        foo = () => {
+          flag.value = false
+        }
+        onServerPrefetch(() => (flag.value = false))
+        return { flag }
+      },
+      components: {
+        Comp,
+      },
+      template: `
+        <span data-allow-mismatch>
+          <Comp v-if="flag"></Comp>
+        </span>
+      `,
+    }
+    // hydrate
+    const container = document.createElement('div')
+    container.innerHTML = await renderToString(h(App))
+    createSSRApp(App).mount(container)
+    expect(container.innerHTML).toBe(
+      '<span data-allow-mismatch=""><div>Comp2</div></span>',
+    )
+    foo()
+    await nextTick()
+    expect(container.innerHTML).toBe(
+      '<span data-allow-mismatch=""><!--v-if--></span>',
+    )
+  })
+
+  test('Teleport unmount (full integration)', async () => {
+    const Comp1 = {
+      template: `
+        <Teleport to="#target"> 
+          <span>Teleported Comp1</span>
+        </Teleport>
+      `,
+    }
+    const Comp2 = {
+      template: `
+        <div>Comp2</div>
+      `,
+    }
+
+    const toggle = ref(true)
+    const App = {
+      template: `
+        <div>
+          <Comp1 v-if="toggle"/>
+          <Comp2 v-else/>
+        </div>
+      `,
+      components: {
+        Comp1,
+        Comp2,
+      },
+      setup() {
+        return { toggle }
+      },
+    }
+
+    const container = document.createElement('div')
+    const teleportContainer = document.createElement('div')
+    teleportContainer.id = 'target'
+    document.body.appendChild(teleportContainer)
+
+    // server render
+    const ctx: SSRContext = {}
+    container.innerHTML = await renderToString(h(App), ctx)
+    expect(container.innerHTML).toBe(
+      '<div><!--teleport start--><!--teleport end--></div>',
+    )
+    teleportContainer.innerHTML = ctx.teleports!['#target']
+
+    // hydrate
+    createSSRApp(App).mount(container)
+    expect(container.innerHTML).toBe(
+      '<div><!--teleport start--><!--teleport end--></div>',
+    )
+    expect(teleportContainer.innerHTML).toBe(
+      '<!--teleport start anchor--><span>Teleported Comp1</span><!--teleport anchor-->',
+    )
+    expect(`Hydration children mismatch`).not.toHaveBeenWarned()
+
+    toggle.value = false
+    await nextTick()
+    expect(container.innerHTML).toBe('<div><div>Comp2</div></div>')
+    expect(teleportContainer.innerHTML).toBe('')
+  })
+
+  test('Teleport unmount (mismatch + full integration)', async () => {
+    const Comp1 = {
+      template: `
+        <Teleport to="#target"> 
+          <span>Teleported Comp1</span>
+        </Teleport>
+      `,
+    }
+    const Comp2 = {
+      template: `
+        <div>Comp2</div>
+      `,
+    }
+
+    const toggle = ref(true)
+    const App = {
+      template: `
+        <div>
+          <Comp1 v-if="toggle"/>
+          <Comp2 v-else/>
+        </div>
+      `,
+      components: {
+        Comp1,
+        Comp2,
+      },
+      setup() {
+        return { toggle }
+      },
+    }
+
+    const container = document.createElement('div')
+    const teleportContainer = document.createElement('div')
+    teleportContainer.id = 'target'
+    document.body.appendChild(teleportContainer)
+
+    // server render
+    container.innerHTML = await renderToString(h(App))
+    expect(container.innerHTML).toBe(
+      '<div><!--teleport start--><!--teleport end--></div>',
+    )
+    expect(teleportContainer.innerHTML).toBe('')
+
+    // hydrate
+    createSSRApp(App).mount(container)
+    expect(container.innerHTML).toBe(
+      '<div><!--teleport start--><!--teleport end--></div>',
+    )
+    expect(teleportContainer.innerHTML).toBe('<span>Teleported Comp1</span>')
+    expect(`Hydration children mismatch`).toHaveBeenWarned()
+
+    toggle.value = false
+    await nextTick()
+    expect(container.innerHTML).toBe('<div><div>Comp2</div></div>')
+    expect(teleportContainer.innerHTML).toBe('')
+  })
+
+  test('Teleport unmount (disabled + full integration)', async () => {
+    const disabled = ref(true)
+    const target = ref('#teleport001')
+    const toggle = ref(true)
+
+    const Comp = {
+      template: `
+      <div>
+        <div id="teleport001">
+          <Teleport
+            :to="target"
+            :disabled="disabled"
+          >
+            <template v-for="section in order">
+              <div>{{section}}</div>
+            </template>
+          </Teleport>
+        </div>
+        <div id="teleport002"></div>
+      </div>
+      `,
+      setup() {
+        const order = ref(['A', 'B', 'C'])
+        return { target, disabled, order }
+      },
+    }
+    const App = {
+      template: `<Comp v-if="toggle"/>`,
+      components: {
+        Comp,
+      },
+      setup() {
+        return { toggle }
+      },
+    }
+
+    const container = document.createElement('div')
+    document.body.appendChild(container)
+
+    // server render
+    container.innerHTML = await renderToString(h(App))
+    expect(container.innerHTML).toBe(
+      `<div>` +
+        `<div id="teleport001">` +
+        `<!--teleport start-->` +
+        `<!--[--><div>A</div><div>B</div><div>C</div><!--]-->` +
+        `<!--teleport end-->` +
+        `</div>` +
+        `<div id="teleport002"></div>` +
+        `</div>`,
+    )
+
+    // hydrate
+    createSSRApp(App).mount(container)
+    expect(`Hydration children mismatch`).not.toHaveBeenWarned()
+
+    target.value = '#teleport002'
+    disabled.value = false
+    await nextTick()
+    expect(container.querySelector('#teleport001')!.innerHTML).toBe(
+      '<!--teleport start--><!--teleport end-->',
+    )
+    expect(container.querySelector('#teleport002')!.innerHTML).toBe(
+      '<!--[--><div>A</div><div>B</div><div>C</div><!--]-->',
+    )
+
+    toggle.value = false
+    await nextTick()
+    expect(container.innerHTML).toBe('<!--v-if-->')
+  })
+
+  test('Teleport target change (mismatch + full integration)', async () => {
+    const target = ref('#target1')
+    const Comp = {
+      template: `
+        <Teleport :to="target"> 
+          <span>Teleported</span>
+        </Teleport>
+      `,
+      setup() {
+        return { target }
+      },
+    }
+
+    const App = {
+      template: `
+        <div>
+          <Comp />
+        </div>
+      `,
+      components: {
+        Comp,
+      },
+    }
+
+    const container = document.createElement('div')
+    const teleportContainer1 = document.createElement('div')
+    teleportContainer1.id = 'target1'
+    const teleportContainer2 = document.createElement('div')
+    teleportContainer2.id = 'target2'
+    document.body.appendChild(teleportContainer1)
+    document.body.appendChild(teleportContainer2)
+
+    // server render
+    container.innerHTML = await renderToString(h(App))
+    expect(container.innerHTML).toBe(
+      '<div><!--teleport start--><!--teleport end--></div>',
+    )
+    expect(teleportContainer1.innerHTML).toBe('')
+    expect(teleportContainer2.innerHTML).toBe('')
+
+    // hydrate
+    createSSRApp(App).mount(container)
+    expect(container.innerHTML).toBe(
+      '<div><!--teleport start--><!--teleport end--></div>',
+    )
+    expect(teleportContainer1.innerHTML).toBe('<span>Teleported</span>')
+    expect(teleportContainer2.innerHTML).toBe('')
+    expect(`Hydration children mismatch`).toHaveBeenWarned()
+
+    target.value = '#target2'
+    await nextTick()
+    expect(teleportContainer1.innerHTML).toBe('')
+    expect(teleportContainer2.innerHTML).toBe('<span>Teleported</span>')
+  })
+
+  // compile SSR + client render fn from the same template & hydrate
+  test('full compiler integration', async () => {
+    const mounted: string[] = []
+    const log = vi.fn()
+    const toggle = ref(true)
+
+    const Child = {
+      data() {
+        return {
+          count: 0,
+          text: 'hello',
+          style: {
+            color: 'red',
+          },
+        }
+      },
+      mounted() {
+        mounted.push('child')
+      },
+      template: `
+      <div>
+        <span class="count" :style="style">{{ count }}</span>
+        <button class="inc" @click="count++">inc</button>
+        <button class="change" @click="style.color = 'green'" >change color</button>
+        <button class="emit" @click="$emit('foo')">emit</button>
+        <span class="text">{{ text }}</span>
+        <input v-model="text">
+      </div>
+      `,
+    }
+
+    const App = {
+      setup() {
+        return { toggle }
+      },
+      mounted() {
+        mounted.push('parent')
+      },
+      template: `
+        <div>
+          <span>hello</span>
+          <template v-if="toggle">
+            <Child @foo="log('child')"/>
+            <template v-if="true">
+              <button class="parent-click" @click="log('click')">click me</button>
+            </template>
+          </template>
+          <span>hello</span>
+        </div>`,
+      components: {
+        Child,
+      },
+      methods: {
+        log,
+      },
+    }
+
+    const container = document.createElement('div')
+    // server render
+    container.innerHTML = await renderToString(h(App))
+    // hydrate
+    createSSRApp(App).mount(container)
+
+    // assert interactions
+    // 1. parent button click
+    triggerEvent('click', container.querySelector('.parent-click')!)
+    expect(log).toHaveBeenCalledWith('click')
+
+    // 2. child inc click + text interpolation
+    const count = container.querySelector('.count') as HTMLElement
+    expect(count.textContent).toBe(`0`)
+    triggerEvent('click', container.querySelector('.inc')!)
+    await nextTick()
+    expect(count.textContent).toBe(`1`)
+
+    // 3. child color click + style binding
+    expect(count.style.color).toBe('red')
+    triggerEvent('click', container.querySelector('.change')!)
+    await nextTick()
+    expect(count.style.color).toBe('green')
+
+    // 4. child event emit
+    triggerEvent('click', container.querySelector('.emit')!)
+    expect(log).toHaveBeenCalledWith('child')
+
+    // 5. child v-model
+    const text = container.querySelector('.text')!
+    const input = container.querySelector('input')!
+    expect(text.textContent).toBe('hello')
+    input.value = 'bye'
+    triggerEvent('input', input)
+    await nextTick()
+    expect(text.textContent).toBe('bye')
+  })
+
+  test('handle click error in ssr mode', async () => {
+    const App = {
+      setup() {
+        const throwError = () => {
+          throw new Error('Sentry Error')
+        }
+        return { throwError }
+      },
+      template: `
+        <div>
+          <button class="parent-click" @click="throwError">click me</button>
+        </div>`,
+    }
+
+    const container = document.createElement('div')
+    // server render
+    container.innerHTML = await renderToString(h(App))
+    // hydrate
+    const app = createSSRApp(App)
+    const handler = (app.config.errorHandler = vi.fn())
+    app.mount(container)
+    // assert interactions
+    // parent button click
+    triggerEvent('click', container.querySelector('.parent-click')!)
+    expect(handler).toHaveBeenCalled()
+  })
+
+  test('handle blur error in ssr mode', async () => {
+    const App = {
+      setup() {
+        const throwError = () => {
+          throw new Error('Sentry Error')
+        }
+        return { throwError }
+      },
+      template: `
+        <div>
+          <input class="parent-click" @blur="throwError"/>
+        </div>`,
+    }
+
+    const container = document.createElement('div')
+    // server render
+    container.innerHTML = await renderToString(h(App))
+    // hydrate
+    const app = createSSRApp(App)
+    const handler = (app.config.errorHandler = vi.fn())
+    app.mount(container)
+    // assert interactions
+    // parent blur event
+    triggerEvent('blur', container.querySelector('.parent-click')!)
+    expect(handler).toHaveBeenCalled()
+  })
+
+  test('Suspense', async () => {
+    const AsyncChild = {
+      async setup() {
+        const count = ref(0)
+        return () =>
+          h(
+            'span',
+            {
+              onClick: () => {
+                count.value++
+              },
+            },
+            count.value,
+          )
+      },
+    }
+    const { vnode, container } = mountWithHydration('<span>0</span>', () =>
+      h(Suspense, () => h(AsyncChild)),
+    )
+    expect(vnode.el).toBe(container.firstChild)
+    // wait for hydration to finish
+    await new Promise(r => setTimeout(r))
+    triggerEvent('click', container.querySelector('span')!)
+    await nextTick()
+    expect(container.innerHTML).toBe(`<span>1</span>`)
+  })
+
+  // #6638
+  test('Suspense + async component', async () => {
+    let isSuspenseResolved = false
+    let isSuspenseResolvedInChild: any
+    const AsyncChild = defineAsyncComponent(() =>
+      Promise.resolve(
+        defineComponent({
+          setup() {
+            isSuspenseResolvedInChild = isSuspenseResolved
+            const count = ref(0)
+            return () =>
+              h(
+                'span',
+                {
+                  onClick: () => {
+                    count.value++
+                  },
+                },
+                count.value,
+              )
+          },
+        }),
+      ),
+    )
+    const { vnode, container } = mountWithHydration('<span>0</span>', () =>
+      h(
+        Suspense,
+        {
+          onResolve() {
+            isSuspenseResolved = true
+          },
+        },
+        () => h(AsyncChild),
+      ),
+    )
+    expect(vnode.el).toBe(container.firstChild)
+    // wait for hydration to finish
+    await new Promise(r => setTimeout(r))
+
+    expect(isSuspenseResolvedInChild).toBe(false)
+    expect(isSuspenseResolved).toBe(true)
+
+    // assert interaction
+    triggerEvent('click', container.querySelector('span')!)
+    await nextTick()
+    expect(container.innerHTML).toBe(`<span>1</span>`)
+  })
+
+  // updating the content of a nested suspensible suspense while the root
+  // suspense is still hydrating must be patched through: the root suspense
+  // keeps pending deps for the whole hydration, so the skip introduced for
+  // #8678 would drop the update and leave the stale SSR DOM on screen
+  // forever (e.g. a router navigation before hydration finishes)
+  test('Suspense: update nested suspensible suspense during hydration', async () => {
+    // hand-rolled rather than nestedSuspenseApp(): `route` is read in the root
+    // App's own render, so the update reaches the nested boundary through the
+    // root's same-root patch instead of patching it directly
+    const {
+      container,
+      ssrHtml,
+      route,
+      release,
+      onRootResolve,
+      onNestedResolve,
+    } = await hydrateSuspenseApp(gate => {
+      const route = ref('a')
+      const onRootResolve = vi.fn()
+      const onNestedResolve = vi.fn()
+
+      const AsyncChild = defineComponent({
+        async setup() {
+          await gate()
+          return () => h('div', 'async child')
+        },
+      })
+      const PageA = defineComponent({
+        setup: () => () => h('div', [h('span', 'page a'), h(AsyncChild)]),
+      })
+      const PageB = defineComponent({
+        setup: () => () => h('div', [h('span', 'page b')]),
+      })
+
+      const App = defineComponent({
+        setup() {
+          return () =>
+            h(
+              Suspense,
+              { onResolve: onRootResolve },
+              {
+                default: () =>
+                  h(
+                    Suspense,
+                    { suspensible: true, onResolve: onNestedResolve },
+                    {
+                      default: () =>
+                        route.value === 'a'
+                          ? h(PageA, { key: 'a' })
+                          : h(PageB, { key: 'b' }),
+                    },
+                  ),
+              },
+            )
+        },
+      })
+
+      return { App, route, onRootResolve, onNestedResolve }
+    })
+
+    expect(ssrHtml).toBe(`<div><span>page a</span><div>async child</div></div>`)
+    expect(onRootResolve).not.toHaveBeenCalled()
+    expect(container.innerHTML).toBe(
+      `<div><span>page a</span><div>async child</div></div>`,
+    )
+
+    // toggle the nested suspense content while hydration is still pending:
+    // the stale SSR branch is unmounted and the new content shows immediately
+    route.value = 'b'
+    await nextTick()
+    expect(container.innerHTML).toBe(`<div><span>page b</span></div>`)
+    expect(onNestedResolve).toHaveBeenCalledTimes(1)
+    expect(onRootResolve).toHaveBeenCalledTimes(1)
+
+    // the late-resolving abandoned branch must not resurrect the old content
+    release()
+    await new Promise(r => setTimeout(r))
+    expect(container.innerHTML).toBe(`<div><span>page b</span></div>`)
+    expect(onNestedResolve).toHaveBeenCalledTimes(1)
+    expect(onRootResolve).toHaveBeenCalledTimes(1)
+  })
+
+  test('Suspense: updating resolved nested suspense does not resolve hydrating parent', async () => {
+    const { container, route, release, onRootResolve } =
+      await hydrateSuspenseApp(gate => {
+        const route = ref('a')
+        const onRootResolve = vi.fn()
+
+        const AsyncSibling = defineComponent({
+          async setup() {
+            await gate()
+            return () => h('span', 'async sibling')
+          },
+        })
+        const PageA = defineComponent({
+          setup: () => () => h('p', 'page a'),
+        })
+        const PageB = defineComponent({
+          setup: () => () => h('p', 'page b'),
+        })
+        const RouteView = defineComponent({
+          setup: () => () =>
+            h(
+              Suspense,
+              { suspensible: true },
+              {
+                default: () => (route.value === 'a' ? h(PageA) : h(PageB)),
+              },
+            ),
+        })
+        const App = defineComponent({
+          setup: () => () =>
+            h(
+              Suspense,
+              { onResolve: onRootResolve },
+              { default: () => h('div', [h(AsyncSibling), h(RouteView)]) },
+            ),
+        })
+
+        return { App, route, onRootResolve }
+      })
+
+    expect(onRootResolve).not.toHaveBeenCalled()
+
+    route.value = 'b'
+    await nextTick()
+    expect(container.innerHTML).toBe(
+      `<div><span>async sibling</span><p>page b</p></div>`,
+    )
+    expect(onRootResolve).not.toHaveBeenCalled()
+
+    release()
+    await new Promise(r => setTimeout(r))
+    expect(onRootResolve).toHaveBeenCalledTimes(1)
+  })
+
+  // a nested suspense that was already toggled once during hydration has
+  // isHydrating unset, but while the root suspense is still hydrating a
+  // second toggle must also be patched through (checked via
+  // parentSuspense.isHydrating): the first toggle may leave the boundary
+  // pending on an async branch, and dropping the second toggle would strand
+  // the view on the stale SSR DOM until that abandoned branch resolves
+  test('Suspense: update nested suspensible suspense twice during hydration', async () => {
+    const { container, ssrHtml, route, release, onRootResolve, onChildSetup } =
+      await hydrateSuspenseApp(gate => {
+        const route = ref('a')
+        const onRootResolve = vi.fn()
+        const onChildSetup = vi.fn()
+
+        const asyncChild = (name: string, text: string) =>
+          defineComponent({
+            async setup() {
+              onChildSetup(text)
+              await gate(name)
+              return () => h('div', text)
+            },
+          })
+        const HydrationChild = asyncChild('hydration', 'hydration child')
+        const TargetChild = asyncChild('target', 'target child')
+
+        const PageA = defineComponent({
+          setup: () => () => h('div', [h('span', 'page a'), h(HydrationChild)]),
+        })
+        const PageB = defineComponent({
+          setup: () => () => h('div', [h('span', 'page b'), h(TargetChild)]),
+        })
+        const PageC = defineComponent({
+          setup: () => () => h('div', [h('span', 'page c')]),
+        })
+
+        const App = nestedSuspenseApp({
+          onRootResolve,
+          content: () =>
+            route.value === 'a'
+              ? h(PageA, { key: 'a' })
+              : route.value === 'b'
+                ? h(PageB, { key: 'b' })
+                : h(PageC, { key: 'c' }),
+        })
+
+        return { App, route, onRootResolve, onChildSetup }
+      })
+
+    expect(ssrHtml).toBe(
+      `<div><span>page a</span><div>hydration child</div></div>`,
+    )
+    expect(onRootResolve).not.toHaveBeenCalled()
+
+    // first toggle while hydrating: the target is mounted but pends on its
+    // async child, so the SSR DOM of page a stays visible and the boundary is
+    // no longer hydrating
+    route.value = 'b'
+    await nextTick()
+    expect(onChildSetup).toHaveBeenCalledWith('target child')
+    expect(container.innerHTML).toBe(
+      `<div><span>page a</span><div>hydration child</div></div>`,
+    )
+    expect(onRootResolve).not.toHaveBeenCalled()
+
+    // second toggle while the root suspense is still hydrating
+    route.value = 'c'
+    await nextTick()
+    expect(container.innerHTML).toBe(`<div><span>page c</span></div>`)
+    expect(onRootResolve).toHaveBeenCalledTimes(1)
+
+    // neither abandoned branch may resurrect once its gate resolves
+    release('target')
+    release('hydration')
+    await new Promise(r => setTimeout(r))
+    expect(container.innerHTML).toBe(`<div><span>page c</span></div>`)
+    expect(onRootResolve).toHaveBeenCalledTimes(1)
+  })
+
+  // the common case: navigate during hydration to a page that is itself
+  // async, then let it load. the SSR DOM stays until the target's async setup
+  // resolves, then the target replaces it and the root resolves exactly once
+  test('Suspense: update nested suspensible suspense during hydration to an async target', async () => {
+    const { container, ssrHtml, route, release, onRootResolve } =
+      await hydrateSuspenseApp(gate => {
+        const route = ref('a')
+        const onRootResolve = vi.fn()
+
+        const HydrationChild = defineComponent({
+          async setup() {
+            await gate('hydration')
+            return () => h('div', 'hydration child')
+          },
+        })
+        const TargetChild = defineComponent({
+          async setup() {
+            await gate('target')
+            return () => h('div', 'target child')
+          },
+        })
+
+        const PageA = defineComponent({
+          setup: () => () => h('div', [h('span', 'page a'), h(HydrationChild)]),
+        })
+        const PageB = defineComponent({
+          setup: () => () => h('div', [h('span', 'page b'), h(TargetChild)]),
+        })
+
+        const App = nestedSuspenseApp({
+          onRootResolve,
+          content: () =>
+            route.value === 'a'
+              ? h(PageA, { key: 'a' })
+              : h(PageB, { key: 'b' }),
+        })
+
+        return { App, route, onRootResolve }
+      })
+
+    expect(ssrHtml).toBe(
+      `<div><span>page a</span><div>hydration child</div></div>`,
+    )
+    expect(onRootResolve).not.toHaveBeenCalled()
+
+    // the target pends on its own async child: the SSR DOM stays visible
+    route.value = 'b'
+    await nextTick()
+    expect(container.innerHTML).toBe(
+      `<div><span>page a</span><div>hydration child</div></div>`,
+    )
+    expect(onRootResolve).not.toHaveBeenCalled()
+
+    // the target finishes loading: it replaces the SSR DOM and hydration
+    // completes without waiting for the abandoned branch
+    release('target')
+    await new Promise(r => setTimeout(r))
+    expect(container.innerHTML).toBe(
+      `<div><span>page b</span><div>target child</div></div>`,
+    )
+    expect(onRootResolve).toHaveBeenCalledTimes(1)
+
+    // the abandoned branch resolving must not resurrect the old content
+    release('hydration')
+    await new Promise(r => setTimeout(r))
+    expect(container.innerHTML).toBe(
+      `<div><span>page b</span><div>target child</div></div>`,
+    )
+    expect(onRootResolve).toHaveBeenCalledTimes(1)
+  })
+
+  // an interrupted async setup() component may have claimed a multi-node
+  // fragment; its hydration placeholder must cover the whole range so the
+  // toggle removes every claimed node and anchors the new branch correctly
+  test('Suspense: update nested suspensible suspense during hydration with a multi-root async branch root', async () => {
+    const { container, ssrHtml, route, release, onRootResolve } =
+      await hydrateSuspenseApp(gate => {
+        const route = ref('a')
+        const onRootResolve = vi.fn()
+
+        const PageA = defineComponent({
+          async setup() {
+            await gate()
+            return () => [h('span', 'page a1'), h('span', 'page a2')]
+          },
+        })
+        const PageB = defineComponent({
+          setup: () => () => h('div', [h('span', 'page b')]),
+        })
+
+        const App = nestedSuspenseApp({
+          onRootResolve,
+          content: () =>
+            route.value === 'a'
+              ? h(PageA, { key: 'a' })
+              : h(PageB, { key: 'b' }),
+        })
+
+        return { App, route, onRootResolve }
+      })
+
+    expect(ssrHtml).toBe(
+      `<!--[--><span>page a1</span><span>page a2</span><!--]-->`,
+    )
+    expect(onRootResolve).not.toHaveBeenCalled()
+
+    route.value = 'b'
+    await nextTick()
+    expect(container.innerHTML).toBe(`<div><span>page b</span></div>`)
+    expect(onRootResolve).toHaveBeenCalledTimes(1)
+
+    release()
+    await new Promise(r => setTimeout(r))
+    expect(container.innerHTML).toBe(`<div><span>page b</span></div>`)
+    expect(onRootResolve).toHaveBeenCalledTimes(1)
+  })
+
+  // a single hydrating suspense toggled away from a branch root whose async
+  // setup() is still pending used to crash resolving: the component never
+  // rendered, so there was nothing to compute the move anchor from
+  test('Suspense: toggle a hydrating suspense away from an unresolved async branch root', async () => {
+    const { container, ssrHtml, route, release, onResolve } =
+      await hydrateSuspenseApp(gate => {
+        const route = ref('a')
+        const onResolve = vi.fn()
+
+        const PageA = defineComponent({
+          async setup() {
+            await gate()
+            return () => h('div', [h('span', 'page a')])
+          },
+        })
+        const PageB = defineComponent({
+          setup: () => () => h('div', [h('span', 'page b')]),
+        })
+
+        const App = defineComponent({
+          setup() {
+            return () =>
+              h(
+                Suspense,
+                { onResolve },
+                {
+                  default: () =>
+                    route.value === 'a'
+                      ? h(PageA, { key: 'a' })
+                      : h(PageB, { key: 'b' }),
+                },
+              )
+          },
+        })
+
+        return { App, route, onResolve }
+      })
+
+    expect(ssrHtml).toBe(`<div><span>page a</span></div>`)
+    expect(onResolve).not.toHaveBeenCalled()
+
+    route.value = 'b'
+    await nextTick()
+    expect(container.innerHTML).toBe(`<div><span>page b</span></div>`)
+    expect(onResolve).toHaveBeenCalledTimes(1)
+
+    release()
+    await new Promise(r => setTimeout(r))
+    expect(container.innerHTML).toBe(`<div><span>page b</span></div>`)
+    expect(onResolve).toHaveBeenCalledTimes(1)
+  })
+
+  // same for an async component wrapper that has not loaded yet: it already
+  // had a hydration placeholder (#3787), but without a render job the
+  // placeholder was never unmounted, so the SSR DOM stayed next to the new
+  // branch
+  test('Suspense: toggle a hydrating suspense away from an unloaded async component', async () => {
+    const { container, ssrHtml, route, release, onResolve } =
+      await hydrateSuspenseApp(gate => {
+        const route = ref('a')
+        const onResolve = vi.fn()
+
+        const PageAInner = defineComponent({
+          setup: () => () => h('div', [h('span', 'page a')]),
+        })
+        const PageA = defineAsyncComponent(() => gate().then(() => PageAInner))
+        const PageB = defineComponent({
+          setup: () => () => h('div', [h('span', 'page b')]),
+        })
+
+        const App = defineComponent({
+          setup() {
+            return () =>
+              h(
+                Suspense,
+                { onResolve },
+                {
+                  default: () =>
+                    route.value === 'a'
+                      ? h(PageA, { key: 'a' })
+                      : h(PageB, { key: 'b' }),
+                },
+              )
+          },
+        })
+
+        return { App, route, onResolve }
+      })
+
+    expect(ssrHtml).toBe(`<div><span>page a</span></div>`)
+    expect(onResolve).not.toHaveBeenCalled()
+
+    route.value = 'b'
+    await nextTick()
+    expect(container.innerHTML).toBe(`<div><span>page b</span></div>`)
+    expect(onResolve).toHaveBeenCalledTimes(1)
+
+    // the abandoned chunk finishing must not resurrect the old branch
+    release()
+    await new Promise(r => setTimeout(r))
+    expect(container.innerHTML).toBe(`<div><span>page b</span></div>`)
+    expect(onResolve).toHaveBeenCalledTimes(1)
+  })
+
+  // the toggled-away root stays on screen while the new branch loads. its
+  // setup finishing in that window must not render yet: async children it
+  // mounts would be counted as deps of the new branch. once the toggle is
+  // reverted and the boundary has settled, it hydrates in place
+  test('Suspense: toggle a hydrating suspense away from an unresolved async branch root to a pending branch and back', async () => {
+    const renderA = vi.fn(() => h('div', [h('span', 'page a')]))
+    const { container, ssrHtml, route, release, onResolve } =
+      await hydrateSuspenseApp(gate => {
+        const route = ref('a')
+        const onResolve = vi.fn()
+
+        const PageA = defineComponent({
+          async setup() {
+            await gate('a')
+            return renderA
+          },
+        })
+        const PageB = defineComponent({
+          async setup() {
+            await gate('b')
+            return () => h('div', [h('span', 'page b')])
+          },
+        })
+
+        const App = defineComponent({
+          setup() {
+            return () =>
+              h(
+                Suspense,
+                { onResolve },
+                {
+                  default: () =>
+                    route.value === 'a'
+                      ? h(PageA, { key: 'a' })
+                      : h(PageB, { key: 'b' }),
+                },
+              )
+          },
+        })
+
+        return { App, route, onResolve }
+      })
+
+    expect(ssrHtml).toBe(`<div><span>page a</span></div>`)
+    renderA.mockClear()
+
+    route.value = 'b'
+    await nextTick()
+    expect(container.innerHTML).toBe(`<div><span>page a</span></div>`)
+    expect(onResolve).not.toHaveBeenCalled()
+
+    release('a')
+    await new Promise(r => setTimeout(r))
+    expect(container.innerHTML).toBe(`<div><span>page a</span></div>`)
+    expect(renderA).not.toHaveBeenCalled()
+    expect(onResolve).not.toHaveBeenCalled()
+
+    route.value = 'a'
+    await nextTick()
+    expect(container.innerHTML).toBe(`<div><span>page a</span></div>`)
+    expect(renderA).toHaveBeenCalledTimes(1)
+    expect(onResolve).toHaveBeenCalledTimes(1)
+  })
+
+  test('Suspense: async child of a toggled-away hydrating root does not hold the pending branch', async () => {
+    const { container, ssrHtml, route, release, onResolve } =
+      await hydrateSuspenseApp(gate => {
+        const route = ref('a')
+        const onResolve = vi.fn()
+
+        const Stuck = defineComponent({
+          async setup() {
+            await gate('stuck')
+            return () => h('span', 'stuck')
+          },
+        })
+        const PageA = defineComponent({
+          async setup() {
+            await gate('a')
+            return () => h('div', [h(Stuck)])
+          },
+        })
+        const PageB = defineComponent({
+          async setup() {
+            await gate('b')
+            return () => h('div', [h('span', 'page b')])
+          },
+        })
+
+        const App = defineComponent({
+          setup() {
+            return () =>
+              h(
+                Suspense,
+                { onResolve },
+                {
+                  default: () =>
+                    route.value === 'a'
+                      ? h(PageA, { key: 'a' })
+                      : h(PageB, { key: 'b' }),
+                },
+              )
+          },
+        })
+
+        return { App, route, onResolve }
+      })
+
+    expect(ssrHtml).toBe(`<div><span>stuck</span></div>`)
+
+    route.value = 'b'
+    await nextTick()
+    expect(container.innerHTML).toBe(`<div><span>stuck</span></div>`)
+    expect(onResolve).not.toHaveBeenCalled()
+
+    // page a finishes first; the never-loading child it renders must not be
+    // counted as a dep of page b
+    release('a')
+    await new Promise(r => setTimeout(r))
+    release('b')
+    await new Promise(r => setTimeout(r))
+    expect(container.innerHTML).toBe(`<div><span>page b</span></div>`)
+    expect(onResolve).toHaveBeenCalledTimes(1)
+  })
+
+  // an out-in transition around a hydrating suspense defers moving the new
+  // branch in until the old branch's leave transition has finished. when the
+  // old branch root's async setup() is still pending, its claimed DOM is torn
+  // down through the hydration placeholder, which must run the leave hooks in
+  // place of the root the component never rendered - otherwise `afterLeave`
+  // never fires and the new branch stays parked in the hidden container
+  test('Suspense: update nested suspensible suspense during hydration inside an out-in transition', async () => {
+    let finishLeave: (() => void) | undefined
+    const { container, ssrHtml, route, release, onRootResolve, onLeave } =
+      await hydrateSuspenseApp(gate => {
+        const route = ref('a')
+        const onRootResolve = vi.fn()
+        const onLeave = vi.fn((el: Element, done: () => void) => {
+          finishLeave = done
+        })
+
+        const PageA = defineComponent({
+          async setup() {
+            await gate()
+            return () => h('div', [h('span', 'page a')])
+          },
+        })
+        const PageB = defineComponent({
+          setup: () => () => h('div', [h('span', 'page b')]),
+        })
+
+        const App = nestedSuspenseApp({
+          onRootResolve,
+          transition: { mode: 'out-in', css: false, onLeave },
+          content: () =>
+            route.value === 'a'
+              ? h(PageA, { key: 'a' })
+              : h(PageB, { key: 'b' }),
+        })
+
+        return { App, route, onRootResolve, onLeave }
+      })
+
+    expect(ssrHtml).toBe(`<div><span>page a</span></div>`)
+    expect(onRootResolve).not.toHaveBeenCalled()
+    const ssrRoot = container.firstChild!
+
+    // the leave transition runs on the DOM page a claimed, and the new
+    // branch stays parked until it finishes
+    route.value = 'b'
+    await nextTick()
+    expect(onLeave).toHaveBeenCalledTimes(1)
+    expect(onLeave.mock.calls[0][0]).toBe(ssrRoot)
+    expect(container.innerHTML).toBe(`<div><span>page a</span></div>`)
+    expect(onRootResolve).toHaveBeenCalledTimes(1)
+
+    finishLeave!()
+    expect(ssrRoot.parentNode).toBe(null)
+    expect(container.innerHTML).toBe(`<div><span>page b</span></div>`)
+
+    release()
+    await new Promise(r => setTimeout(r))
+    expect(container.innerHTML).toBe(`<div><span>page b</span></div>`)
+    expect(onRootResolve).toHaveBeenCalledTimes(1)
+  })
+
+  // a re-render of the same branch before the toggle replaces the pending
+  // component's vnode: that vnode must keep the el adopted during hydration,
+  // and it carries the transition hooks the boundary later mutates - so the
+  // placeholder must take the hooks over at teardown, not when it is created
+  test('Suspense: update nested suspensible suspense during hydration inside an out-in transition after a same-branch update', async () => {
+    const { container, ssrHtml, route, tick, release, onRootResolve, onLeave } =
+      await hydrateSuspenseApp(gate => {
+        const route = ref('a')
+        const tick = ref(0)
+        const onRootResolve = vi.fn()
+        const onLeave = vi.fn((el: Element, done: () => void) => done())
+
+        const PageA = defineComponent({
+          props: { tick: Number },
+          async setup() {
+            await gate()
+            return () => h('div', [h('span', 'page a')])
+          },
+        })
+        const PageB = defineComponent({
+          setup: () => () => h('div', [h('span', 'page b')]),
+        })
+
+        const App = nestedSuspenseApp({
+          onRootResolve,
+          transition: { mode: 'out-in', css: false, onLeave },
+          content: () =>
+            route.value === 'a'
+              ? h(PageA, { key: 'a', tick: tick.value })
+              : h(PageB, { key: 'b' }),
+        })
+
+        return { App, route, tick, onRootResolve, onLeave }
+      })
+
+    expect(ssrHtml).toBe(`<div><span>page a</span></div>`)
+    expect(onRootResolve).not.toHaveBeenCalled()
+
+    // an update to the still-pending branch root first
+    tick.value++
+    await nextTick()
+    expect(container.innerHTML).toBe(`<div><span>page a</span></div>`)
+    expect(onLeave).not.toHaveBeenCalled()
+
+    route.value = 'b'
+    await nextTick()
+    expect(onLeave).toHaveBeenCalledTimes(1)
+    expect(container.innerHTML).toBe(`<div><span>page b</span></div>`)
+    expect(onRootResolve).toHaveBeenCalledTimes(1)
+
+    release()
+    await new Promise(r => setTimeout(r))
+    expect(container.innerHTML).toBe(`<div><span>page b</span></div>`)
+    expect(onRootResolve).toHaveBeenCalledTimes(1)
+  })
+
+  // the interrupted branch root may have rendered nothing on the server, so
+  // the DOM it claimed is a comment node. its placeholder must mirror that:
+  // the leave hooks it takes over on teardown belong to element roots only,
+  // and running them against a comment node throws
+  test('Suspense: update nested suspensible suspense during hydration inside an out-in transition from a comment root', async () => {
+    const { container, ssrHtml, route, release, onRootResolve } =
+      await hydrateSuspenseApp(gate => {
+        const route = ref('a')
+        const onRootResolve = vi.fn()
+
+        const PageA = defineComponent({
+          async setup() {
+            await gate()
+            return () => null
+          },
+        })
+        const PageB = defineComponent({
+          setup: () => () => h('div', [h('span', 'page b')]),
+        })
+
+        const App = nestedSuspenseApp({
+          onRootResolve,
+          transition: { mode: 'out-in' },
+          content: () =>
+            route.value === 'a'
+              ? h(PageA, { key: 'a' })
+              : h(PageB, { key: 'b' }),
+        })
+
+        return { App, route, onRootResolve }
+      })
+
+    expect(ssrHtml).toBe(`<!---->`)
+    expect(onRootResolve).not.toHaveBeenCalled()
+
+    // nothing to animate out: the comment is dropped and the new branch
+    // moves in right away
+    route.value = 'b'
+    await nextTick()
+    expect(container.innerHTML).not.toContain(`<!---->`)
+    expect(container.querySelector('span')!.textContent).toBe('page b')
+    expect(onRootResolve).toHaveBeenCalledTimes(1)
+
+    release()
+    await new Promise(r => setTimeout(r))
+    expect(container.querySelector('span')!.textContent).toBe('page b')
+    expect(onRootResolve).toHaveBeenCalledTimes(1)
+  })
+
+  test('Suspense: finish out-in transition from a fragment hydration placeholder', async () => {
+    const { container, ssrHtml, route, release, onRootResolve, onLeave } =
+      await hydrateSuspenseApp(gate => {
+        const route = ref('a')
+        const onRootResolve = vi.fn()
+        const onLeave = vi.fn((el: Element, done: () => void) => done())
+        const PageA = defineComponent({
+          async setup() {
+            await gate()
+            return compileToFunction('<!--before--><div>page a</div>')
+          },
+        })
+        const PageB = defineComponent({
+          setup: () => () => h('div', 'page b'),
+        })
+        const App = nestedSuspenseApp({
+          onRootResolve,
+          transition: { mode: 'out-in', css: false, onLeave },
+          content: () => (route.value === 'a' ? h(PageA) : h(PageB)),
+        })
+
+        return { App, route, onRootResolve, onLeave }
+      })
+
+    expect(ssrHtml).toBe(`<!--[--><!--before--><div>page a</div><!--]-->`)
+    expect(onRootResolve).not.toHaveBeenCalled()
+
+    route.value = 'b'
+    await nextTick()
+    expect(container.innerHTML).toBe(`<div>page b</div>`)
+    expect(onLeave).not.toHaveBeenCalled()
+    expect(onRootResolve).toHaveBeenCalledTimes(1)
+
+    release()
+    await new Promise(r => setTimeout(r))
+    expect(container.innerHTML).toBe(`<div>page b</div>`)
+    expect(onRootResolve).toHaveBeenCalledTimes(1)
+  })
+
+  // a component whose async setup() is still pending can be unmounted in
+  // place while its boundary keeps hydrating (e.g. a v-if inside the pending
+  // branch). its claimed DOM is torn down through the placeholder, but
+  // `isUnmounted` is only set once the boundary resolves, so the late
+  // registerDep callback would still hydrate the component into the detached
+  // nodes - which throws for a multi-root component, so the dep was never
+  // released and both boundaries stayed pending forever
+  test('Suspense: remove an unresolved multi-root async component in place during hydration', async () => {
+    const { container, ssrHtml, show, release, onRootResolve } =
+      await hydrateSuspenseApp(gate => {
+        const show = ref(true)
+        const onRootResolve = vi.fn()
+
+        const AsyncChild = defineComponent({
+          async setup() {
+            await gate()
+            return () => [h('span', 'child 1'), h('span', 'child 2')]
+          },
+        })
+
+        const App = nestedSuspenseApp({
+          onRootResolve,
+          content: () =>
+            h('div', [show.value ? h(AsyncChild) : null, h('span', 'rest')]),
+        })
+
+        return { App, show, onRootResolve }
+      })
+
+    expect(ssrHtml).toBe(
+      `<div><!--[--><span>child 1</span><span>child 2</span><!--]--><span>rest</span></div>`,
+    )
+    expect(onRootResolve).not.toHaveBeenCalled()
+
+    // remove the pending component in place: its whole claimed range goes,
+    // the boundary keeps waiting for the abandoned dep
+    show.value = false
+    await nextTick()
+    expect(container.innerHTML).toBe(`<div><!----><span>rest</span></div>`)
+    expect(onRootResolve).not.toHaveBeenCalled()
+
+    // the abandoned setup() resolving must release the dep without touching
+    // the detached DOM, so hydration can finish
+    release()
+    await new Promise(r => setTimeout(r))
+    expect(container.innerHTML).toBe(`<div><!----><span>rest</span></div>`)
+    expect(onRootResolve).toHaveBeenCalledTimes(1)
+  })
+
+  // the same in-place removal of a single-root component: hydrating it into
+  // the detached node would not throw, but it would run the component's
+  // render for nothing. the dep must be released without rendering
+  test('Suspense: remove an unresolved async component in place during hydration', async () => {
+    const { container, ssrHtml, show, render, release, onRootResolve } =
+      await hydrateSuspenseApp(gate => {
+        const show = ref(true)
+        const render = vi.fn(() => h('span', 'child'))
+        const onRootResolve = vi.fn()
+
+        const AsyncChild = defineComponent({
+          async setup() {
+            await gate()
+            return render
+          },
+        })
+
+        const App = nestedSuspenseApp({
+          onRootResolve,
+          content: () =>
+            h('div', [show.value ? h(AsyncChild) : null, h('span', 'rest')]),
+        })
+
+        return { App, show, render, onRootResolve }
+      })
+
+    expect(ssrHtml).toBe(`<div><span>child</span><span>rest</span></div>`)
+    expect(onRootResolve).not.toHaveBeenCalled()
+
+    show.value = false
+    await nextTick()
+    expect(container.innerHTML).toBe(`<div><!----><span>rest</span></div>`)
+    expect(onRootResolve).not.toHaveBeenCalled()
+
+    release()
+    await new Promise(r => setTimeout(r))
+    expect(render).not.toHaveBeenCalled()
+    expect(container.innerHTML).toBe(`<div><!----><span>rest</span></div>`)
+    expect(onRootResolve).toHaveBeenCalledTimes(1)
+  })
+
+  test('Suspense: remove an ancestor of an unresolved async component during hydration', async () => {
+    const { container, show, render, release, onRootResolve } =
+      await hydrateSuspenseApp(gate => {
+        const show = ref(true)
+        const render = vi.fn(() => h('span', 'child'))
+        const onRootResolve = vi.fn()
+
+        const AsyncChild = defineComponent({
+          async setup() {
+            await gate()
+            return render
+          },
+        })
+
+        const App = nestedSuspenseApp({
+          onRootResolve,
+          content: () =>
+            h('div', [
+              show.value ? h('section', [h(AsyncChild)]) : null,
+              h('span', 'rest'),
+            ]),
+        })
+
+        return { App, show, render, onRootResolve }
+      })
+
+    const section = container.querySelector('section')!
+    const claimedNode = section.firstChild!
+    expect(onRootResolve).not.toHaveBeenCalled()
+
+    show.value = false
+    await nextTick()
+    expect(container.innerHTML).toBe(`<div><!----><span>rest</span></div>`)
+    // Removing the ancestor leaves the claimed node attached to that ancestor.
+    expect(section.parentNode).toBeNull()
+    expect(claimedNode.parentNode).toBe(section)
+    expect(onRootResolve).not.toHaveBeenCalled()
+
+    release()
+    await new Promise(r => setTimeout(r))
+    expect(container.innerHTML).toBe(`<div><!----><span>rest</span></div>`)
+    expect(onRootResolve).toHaveBeenCalledTimes(1)
+    expect(render).not.toHaveBeenCalled()
+  })
+
+  test('Suspense: remove an unresolved async component after an update during hydration', async () => {
+    const { container, ssrHtml, show, msg, release, onRootResolve } =
+      await hydrateSuspenseApp(gate => {
+        const show = ref(true)
+        const msg = ref('one')
+        const onRootResolve = vi.fn()
+
+        const AsyncChild = defineComponent({
+          props: ['msg'],
+          async setup(props) {
+            await gate()
+            return () => h('span', props.msg)
+          },
+        })
+
+        const App = nestedSuspenseApp({
+          onRootResolve,
+          content: () =>
+            h('div', [
+              show.value ? h(AsyncChild, { msg: msg.value }) : null,
+              h('span', 'rest'),
+            ]),
+        })
+
+        return { App, show, msg, onRootResolve }
+      })
+
+    expect(ssrHtml).toBe(`<div><span>one</span><span>rest</span></div>`)
+    expect(onRootResolve).not.toHaveBeenCalled()
+
+    // replace the pending component vnode before removing it
+    msg.value = 'two'
+    await nextTick()
+    show.value = false
+    await nextTick()
+    expect(container.innerHTML).toBe(`<div><!----><span>rest</span></div>`)
+    expect(onRootResolve).not.toHaveBeenCalled()
+
+    release()
+    await new Promise(r => setTimeout(r))
+    expect(container.innerHTML).toBe(`<div><!----><span>rest</span></div>`)
+    expect(onRootResolve).toHaveBeenCalledTimes(1)
+  })
+
+  // releasing the dep of a component removed in place may resolve the boundary
+  // synchronously; that must not happen while a sibling top-level-await
+  // component is still the current instance (withAsyncContext restores it and
+  // defers the cleanup to a later microtask)
+  test('Suspense: resolve after an in-place removal during hydration does not leak a sibling as the current instance', async () => {
+    const seen: unknown[] = []
+    const { container, ssrHtml, show, release } = await hydrateSuspenseApp(
+      gate => {
+        const show = ref(true)
+
+        // compiled shape of a <script setup> top-level await
+        const A = defineComponent({
+          async setup() {
+            let __temp: any, __restore: any
+            ;[__temp, __restore] = withAsyncContext(() => gate('a'))
+            __temp = await __temp
+            __restore()
+            return () => h('div', 'A')
+          },
+        })
+        const B = defineComponent({
+          async setup() {
+            await gate('b')
+            return () => h('div', 'B')
+          },
+        })
+
+        const View = defineComponent({
+          setup: () => () =>
+            h('div', [
+              h(
+                Suspense,
+                {
+                  suspensible: true,
+                  onResolve: () => seen.push(getCurrentInstance()),
+                },
+                {
+                  default: () =>
+                    h('div', [show.value ? h(B) : null, h('span', 'rest')]),
+                },
+              ),
+              h(Suspense, { suspensible: true }, () => h(A)),
+            ]),
+        })
+        const App = defineComponent({
+          setup: () => () => h(Suspense, null, () => h(View)),
+        })
+
+        return { App, show }
+      },
+    )
+
+    expect(ssrHtml).toBe(
+      `<div><div><div>B</div><span>rest</span></div><div>A</div></div>`,
+    )
+
+    // remove B in place while pending, then let B settle right before A's
+    // setup restores A as the current instance
+    show.value = false
+    await nextTick()
+    release('b')
+    release('a')
+    await new Promise(r => setTimeout(r))
+    expect(container.innerHTML).toBe(
+      `<div><div><!----><span>rest</span></div><div>A</div></div>`,
+    )
+    expect(seen).toEqual([null])
+  })
+
+  // a same-root-type update to a hydrating suspense used to patch against the
+  // detached hiddenContainer while the anchors come from the live SSR DOM, so
+  // inserting a node threw. the pending branch of a hydrating boundary lives
+  // in the real container (its DOM was adopted in place and resolving does
+  // not move it), so it must be patched there - and the in-place patch must
+  // not resolve the still-hydrating boundary
+  test('Suspense: update the pending branch of a hydrating suspense in place', async () => {
+    const { container, ssrHtml, items, release, onResolve } =
+      await hydrateSuspenseApp(gate => {
+        const items = ref(['one', 'two'])
+        const onResolve = vi.fn()
+
+        const AsyncChild = defineComponent({
+          async setup() {
+            await gate()
+            return () => h('div', 'async child')
+          },
+        })
+
+        const App = defineComponent({
+          setup() {
+            return () =>
+              h(
+                Suspense,
+                { onResolve },
+                {
+                  default: () =>
+                    h(Fragment, [
+                      ...items.value.map(i => h('div', { key: i }, i)),
+                      h(AsyncChild),
+                    ]),
+                },
+              )
+          },
+        })
+
+        return { App, items, onResolve }
+      })
+
+    expect(ssrHtml).toBe(
+      `<!--[--><div>one</div><div>two</div><div>async child</div><!--]-->`,
+    )
+    expect(onResolve).not.toHaveBeenCalled()
+
+    // insert a keyed child while the boundary is still hydrating: the node
+    // must land in the live DOM, next to the still-pending async child
+    items.value = ['one', 'two', 'three']
+    await nextTick()
+    expect(container.innerHTML).toBe(
+      `<!--[--><div>one</div><div>two</div><div>three</div><div>async child</div><!--]-->`,
+    )
+    expect(onResolve).not.toHaveBeenCalled()
+
+    release()
+    await new Promise(r => setTimeout(r))
+    expect(container.innerHTML).toBe(
+      `<!--[--><div>one</div><div>two</div><div>three</div><div>async child</div><!--]-->`,
+    )
+    expect(onResolve).toHaveBeenCalledTimes(1)
+  })
+
+  test('Suspense (full integration)', async () => {
+    const mountedCalls: number[] = []
+    const asyncDeps: Promise<any>[] = []
+
+    const AsyncChild = defineComponent({
+      props: ['n'],
+      async setup(props) {
+        const count = ref(props.n)
+        onMounted(() => {
+          mountedCalls.push(props.n)
+        })
+        const p = new Promise(r => setTimeout(r, props.n * 10))
+        asyncDeps.push(p)
+        await p
+        return () =>
+          h(
+            'span',
+            {
+              onClick: () => {
+                count.value++
+              },
+            },
+            count.value,
+          )
+      },
+    })
+
+    const done = vi.fn()
+    const App = {
+      template: `
+      <Suspense @resolve="done">
+        <div>
+          <AsyncChild :n="1" />
+          <AsyncChild :n="2" />
+        </div>
+      </Suspense>`,
+      components: {
+        AsyncChild,
+      },
+      methods: {
+        done,
+      },
+    }
+
+    const container = document.createElement('div')
+    // server render
+    container.innerHTML = await renderToString(h(App))
+    expect(container.innerHTML).toMatchInlineSnapshot(
+      `"<div><span>1</span><span>2</span></div>"`,
+    )
+    // reset asyncDeps from ssr
+    asyncDeps.length = 0
+    // hydrate
+    createSSRApp(App).mount(container)
+
+    expect(mountedCalls.length).toBe(0)
+    expect(asyncDeps.length).toBe(2)
+
+    // wait for hydration to complete
+    await Promise.all(asyncDeps)
+    await new Promise(r => setTimeout(r))
+
+    // should flush buffered effects
+    expect(mountedCalls).toMatchObject([1, 2])
+    expect(container.innerHTML).toMatch(
+      `<div><span>1</span><span>2</span></div>`,
+    )
+
+    const span1 = container.querySelector('span')!
+    triggerEvent('click', span1)
+    await nextTick()
+    expect(container.innerHTML).toMatch(
+      `<div><span>2</span><span>2</span></div>`,
+    )
+
+    const span2 = span1.nextSibling as Element
+    triggerEvent('click', span2)
+    await nextTick()
+    expect(container.innerHTML).toMatch(
+      `<div><span>2</span><span>3</span></div>`,
+    )
+  })
+
+  test('async component', async () => {
+    const spy = vi.fn()
+    const Comp = () =>
+      h(
+        'button',
+        {
+          onClick: spy,
+        },
+        'hello!',
+      )
+
+    let serverResolve: any
+    let AsyncComp = defineAsyncComponent(
+      () =>
+        new Promise(r => {
+          serverResolve = r
+        }),
+    )
+
+    const App = {
+      render() {
+        return ['hello', h(AsyncComp), 'world']
+      },
+    }
+
+    // server render
+    const htmlPromise = renderToString(h(App))
+    serverResolve(Comp)
+    const html = await htmlPromise
+    expect(html).toMatchInlineSnapshot(
+      `"<!--[-->hello<button>hello!</button>world<!--]-->"`,
+    )
+
+    // hydration
+    let clientResolve: any
+    AsyncComp = defineAsyncComponent(
+      () =>
+        new Promise(r => {
+          clientResolve = r
+        }),
+    )
+
+    const container = document.createElement('div')
+    container.innerHTML = html
+    createSSRApp(App).mount(container)
+
+    // hydration not complete yet
+    triggerEvent('click', container.querySelector('button')!)
+    expect(spy).not.toHaveBeenCalled()
+
+    // resolve
+    clientResolve(Comp)
+    await new Promise(r => setTimeout(r))
+
+    // should be hydrated now
+    triggerEvent('click', container.querySelector('button')!)
+    expect(spy).toHaveBeenCalled()
+  })
+
+  // #15091
+  async function assertSkipLazyHydration(detached: 'root' | 'ancestor') {
+    let observer!: IntersectionObserver
+    let observerCallback!: IntersectionObserverCallback
+    const originalIntersectionObserver = globalThis.IntersectionObserver
+    globalThis.IntersectionObserver = class {
+      constructor(callback: IntersectionObserverCallback) {
+        observer = this as any
+        observerCallback = callback
+      }
+      disconnect() {}
+      observe() {}
+    } as any
+
+    try {
+      const Comp = vi.fn(() => h('p', 'hello'))
+      const AsyncComp = defineAsyncComponent({
+        loader: () => Promise.resolve(Comp),
+        hydrate: hydrateOnVisible(),
+      })
+      const App = () => h(AsyncComp)
+      const container = document.createElement('div')
+
+      container.innerHTML = await renderToString(h(App))
+      document.body.appendChild(container)
+      Comp.mockClear()
+      createSSRApp(App).mount(container)
+
+      const el = container.firstElementChild!
+      if (detached === 'root') {
+        el.remove()
+      } else {
+        container.remove()
+      }
+      expect(el.isConnected).toBe(false)
+
+      expect(() =>
+        observerCallback(
+          [{ isIntersecting: true, target: el } as IntersectionObserverEntry],
+          observer,
+        ),
+      ).not.toThrow()
+      expect(Comp).not.toHaveBeenCalled()
+    } finally {
+      globalThis.IntersectionObserver = originalIntersectionObserver
+    }
+  }
+
+  test.each(['root', 'ancestor'] as const)(
+    'skip lazy hydration when the SSR %s is detached',
+    assertSkipLazyHydration,
+  )
+
+  test('unmount a lazily hydrated component that has not hydrated yet', async () => {
+    const Comp = { render: () => h('p', 'hello') }
+    const AsyncComp = defineAsyncComponent({
+      loader: () => Promise.resolve(Comp),
+      // a lazy hydration strategy that has not fired yet, e.g. hydrateOnVisible()
+      // on content that was never scrolled into view
+      hydrate: () => {},
+    })
+
+    const show = ref(true)
+    // the async component is unmounted as part of a parent subtree, which is
+    // what happens on a route change
+    const App = () => h('div', show.value ? [h(AsyncComp)] : [])
+
+    const container = document.createElement('div')
+    container.innerHTML = await renderToString(h(App))
+    document.body.appendChild(container)
+    createSSRApp(App).mount(container)
+
+    // the strategy never fired, so instance.subTree is still null
+    show.value = false
+    await expect(nextTick()).resolves.not.toThrow()
+    // the server-rendered DOM of the never-hydrated component is removed
+    expect(container.innerHTML).toBe('<div></div>')
+  })
+
+  // the #15091 guard skips hydration when the SSR node is detached, which
+  // leaves subTree unset in the same way
+  test('unmount after lazy hydration was skipped for a detached node', async () => {
+    let observer!: IntersectionObserver
+    let observerCallback!: IntersectionObserverCallback
+    const originalIntersectionObserver = globalThis.IntersectionObserver
+    globalThis.IntersectionObserver = class {
+      constructor(callback: IntersectionObserverCallback) {
+        observer = this as any
+        observerCallback = callback
+      }
+      disconnect() {}
+      observe() {}
+    } as any
+
+    try {
+      const Comp = vi.fn(() => h('p', 'hello'))
+      const AsyncComp = defineAsyncComponent({
+        loader: () => Promise.resolve(Comp),
+        hydrate: hydrateOnVisible(),
+      })
+      const show = ref(true)
+      const App = () => h('div', show.value ? [h(AsyncComp)] : [])
+
+      const container = document.createElement('div')
+      container.innerHTML = await renderToString(h(App))
+      document.body.appendChild(container)
+      Comp.mockClear()
+      createSSRApp(App).mount(container)
+
+      // detach, then let the observer fire: hydration bails out
+      const el: Element = container.querySelector('p')!
+      el.remove()
+      observerCallback(
+        [{ isIntersecting: true, target: el } as IntersectionObserverEntry],
+        observer,
+      )
+      await nextTick()
+      expect(Comp).not.toHaveBeenCalled()
+
+      show.value = false
+      await expect(nextTick()).resolves.not.toThrow()
+    } finally {
+      globalThis.IntersectionObserver = originalIntersectionObserver
+    }
+  })
+
+  test('update async wrapper before resolve', async () => {
+    const Comp = {
+      render() {
+        return h('h1', 'Async component')
+      },
+    }
+    let serverResolve: any
+    let AsyncComp = defineAsyncComponent(
+      () =>
+        new Promise(r => {
+          serverResolve = r
+        }),
+    )
+
+    const toggle = ref(true)
+    const App = {
+      setup() {
+        onMounted(() => {
+          // change state, this makes updateComponent(AsyncComp) execute before
+          // the async component is resolved
+          toggle.value = false
+        })
+
+        return () => {
+          return [toggle.value ? 'hello' : 'world', h(AsyncComp)]
+        }
+      },
+    }
+
+    // server render
+    const htmlPromise = renderToString(h(App))
+    serverResolve(Comp)
+    const html = await htmlPromise
+    expect(html).toMatchInlineSnapshot(
+      `"<!--[-->hello<h1>Async component</h1><!--]-->"`,
+    )
+
+    // hydration
+    let clientResolve: any
+    AsyncComp = defineAsyncComponent(
+      () =>
+        new Promise(r => {
+          clientResolve = r
+        }),
+    )
+
+    const container = document.createElement('div')
+    container.innerHTML = html
+    createSSRApp(App).mount(container)
+
+    // resolve
+    clientResolve(Comp)
+    await new Promise(r => setTimeout(r))
+
+    // should be hydrated now
+    expect(`Hydration node mismatch`).not.toHaveBeenWarned()
+    expect(container.innerHTML).toMatchInlineSnapshot(
+      `"<!--[-->world<h1>Async component</h1><!--]-->"`,
+    )
+  })
+
+  // #13510
+  test('update async component after parent mount before async component resolve', async () => {
+    const Comp = {
+      props: ['toggle'],
+      render(this: any) {
+        return h('h1', [
+          this.toggle ? 'Async component' : 'Updated async component',
+        ])
+      },
+    }
+    let serverResolve: any
+    let AsyncComp = defineAsyncComponent(
+      () =>
+        new Promise(r => {
+          serverResolve = r
+        }),
+    )
+
+    const toggle = ref(true)
+    const App = {
+      setup() {
+        onMounted(() => {
+          // change state, after mount and before async component resolve
+          nextTick(() => (toggle.value = false))
+        })
+
+        return () => {
+          return h(AsyncComp, { toggle: toggle.value })
+        }
+      },
+    }
+
+    // server render
+    const htmlPromise = renderToString(h(App))
+    serverResolve(Comp)
+    const html = await htmlPromise
+    expect(html).toMatchInlineSnapshot(`"<h1>Async component</h1>"`)
+
+    // hydration
+    let clientResolve: any
+    AsyncComp = defineAsyncComponent(
+      () =>
+        new Promise(r => {
+          clientResolve = r
+        }),
+    )
+
+    const container = document.createElement('div')
+    container.innerHTML = html
+    createSSRApp(App).mount(container)
+
+    // resolve
+    clientResolve(Comp)
+    await new Promise(r => setTimeout(r))
+
+    // prevent lazy hydration since the component has been patched
+    expect('Skipping lazy hydration for component').toHaveBeenWarned()
+    expect(`Hydration node mismatch`).not.toHaveBeenWarned()
+    expect(container.innerHTML).toMatchInlineSnapshot(
+      `"<h1>Updated async component</h1>"`,
+    )
+  })
+
+  test('hydrate safely when property used by async setup changed before render', async () => {
+    const toggle = ref(true)
+
+    const AsyncComp = {
+      async setup() {
+        await new Promise<void>(r => setTimeout(r, 10))
+        return () => h('h1', 'Async component')
+      },
+    }
+
+    const AsyncWrapper = {
+      render() {
+        return h(AsyncComp)
+      },
+    }
+
+    const SiblingComp = {
+      setup() {
+        toggle.value = false
+        return () => h('span')
+      },
+    }
+
+    const App = {
+      setup() {
+        return () =>
+          h(
+            Suspense,
+            {},
+            {
+              default: () => [
+                h('main', {}, [
+                  h(AsyncWrapper, {
+                    prop: toggle.value ? 'hello' : 'world',
+                  }),
+                  h(SiblingComp),
+                ]),
+              ],
+            },
+          )
+      },
+    }
+
+    // server render
+    const html = await renderToString(h(App))
+
+    expect(html).toMatchInlineSnapshot(
+      `"<main><h1 prop="hello">Async component</h1><span></span></main>"`,
+    )
+
+    expect(toggle.value).toBe(false)
+
+    // hydration
+
+    // reset the value
+    toggle.value = true
+    expect(toggle.value).toBe(true)
+
+    const container = document.createElement('div')
+    container.innerHTML = html
+    createSSRApp(App).mount(container)
+
+    await new Promise(r => setTimeout(r, 10))
+
+    expect(toggle.value).toBe(false)
+
+    // should be hydrated now
+    expect(container.innerHTML).toMatchInlineSnapshot(
+      `"<main><h1 prop="world">Async component</h1><span></span></main>"`,
+    )
+  })
+
+  test('hydrate safely when property used by deep nested async setup changed before render', async () => {
+    const toggle = ref(true)
+
+    const AsyncComp = {
+      async setup() {
+        await new Promise<void>(r => setTimeout(r, 10))
+        return () => h('h1', 'Async component')
+      },
+    }
+
+    const AsyncWrapper = { render: () => h(AsyncComp) }
+    const AsyncWrapperWrapper = { render: () => h(AsyncWrapper) }
+
+    const SiblingComp = {
+      setup() {
+        toggle.value = false
+        return () => h('span')
+      },
+    }
+
+    const App = {
+      setup() {
+        return () =>
+          h(
+            Suspense,
+            {},
+            {
+              default: () => [
+                h('main', {}, [
+                  h(AsyncWrapperWrapper, {
+                    prop: toggle.value ? 'hello' : 'world',
+                  }),
+                  h(SiblingComp),
+                ]),
+              ],
+            },
+          )
+      },
+    }
+
+    // server render
+    const html = await renderToString(h(App))
+
+    expect(html).toMatchInlineSnapshot(
+      `"<main><h1 prop="hello">Async component</h1><span></span></main>"`,
+    )
+
+    expect(toggle.value).toBe(false)
+
+    // hydration
+
+    // reset the value
+    toggle.value = true
+    expect(toggle.value).toBe(true)
+
+    const container = document.createElement('div')
+    container.innerHTML = html
+    createSSRApp(App).mount(container)
+
+    await new Promise(r => setTimeout(r, 10))
+
+    expect(toggle.value).toBe(false)
+
+    // should be hydrated now
+    expect(container.innerHTML).toMatchInlineSnapshot(
+      `"<main><h1 prop="world">Async component</h1><span></span></main>"`,
+    )
+  })
+
+  // #3787
+  test('unmount async wrapper before load', async () => {
+    let resolve: any
+    const AsyncComp = defineAsyncComponent(
+      () =>
+        new Promise(r => {
+          resolve = r
+        }),
+    )
+
+    const show = ref(true)
+    const root = document.createElement('div')
+    root.innerHTML = '<div><div>async</div></div>'
+
+    createSSRApp({
+      render() {
+        return h('div', [show.value ? h(AsyncComp) : h('div', 'hi')])
+      },
+    }).mount(root)
+
+    show.value = false
+    await nextTick()
+    expect(root.innerHTML).toBe('<div><div>hi</div></div>')
+    resolve({})
+  })
+
+  //#12362
+  test('nested async wrapper', async () => {
+    const Toggle = defineAsyncComponent(
+      () =>
+        new Promise(r => {
+          r(
+            defineComponent({
+              setup(_, { slots }) {
+                const show = ref(false)
+                onMounted(() => {
+                  nextTick(() => {
+                    show.value = true
+                  })
+                })
+                return () =>
+                  withDirectives(
+                    h('div', null, [renderSlot(slots, 'default')]),
+                    [[vShow, show.value]],
+                  )
+              },
+            }) as any,
+          )
+        }),
+    )
+
+    const Wrapper = defineAsyncComponent(() => {
+      return new Promise(r => {
+        r(
+          defineComponent({
+            render(this: any) {
+              return renderSlot(this.$slots, 'default')
+            },
+          }) as any,
+        )
+      })
+    })
+
+    const count = ref(0)
+    const fn = vi.fn()
+    const Child = {
+      setup() {
+        onMounted(() => {
+          fn()
+          count.value++
+        })
+        return () => h('div', count.value)
+      },
+    }
+
+    const App = {
+      render() {
+        return h(Toggle, null, {
+          default: () =>
+            h(Wrapper, null, {
+              default: () =>
+                h(Wrapper, null, {
+                  default: () => h(Child),
+                }),
+            }),
+        })
+      },
+    }
+
+    const root = document.createElement('div')
+    root.innerHTML = await renderToString(h(App))
+    expect(root.innerHTML).toMatchInlineSnapshot(
+      `"<div style="display:none;"><!--[--><!--[--><!--[--><div>0</div><!--]--><!--]--><!--]--></div>"`,
+    )
+
+    createSSRApp(App).mount(root)
+    await nextTick()
+    await nextTick()
+    expect(root.innerHTML).toMatchInlineSnapshot(
+      `"<div style=""><!--[--><!--[--><!--[--><div>1</div><!--]--><!--]--><!--]--></div>"`,
+    )
+    expect(fn).toBeCalledTimes(1)
+  })
+
+  test('unmount async wrapper before load (fragment)', async () => {
+    let resolve: any
+    const AsyncComp = defineAsyncComponent(
+      () =>
+        new Promise(r => {
+          resolve = r
+        }),
+    )
+
+    const show = ref(true)
+    const root = document.createElement('div')
+    root.innerHTML = '<div><!--[-->async<!--]--></div>'
+
+    createSSRApp({
+      render() {
+        return h('div', [show.value ? h(AsyncComp) : h('div', 'hi')])
+      },
+    }).mount(root)
+
+    show.value = false
+    await nextTick()
+    expect(root.innerHTML).toBe('<div><div>hi</div></div>')
+    resolve({})
+  })
+
+  test('move async wrapper before load (fragment)', async () => {
+    let resolve: any
+    const Comp = vi.fn(() => [h('i', 'one'), h('b', 'two')])
+    const AsyncComp = defineAsyncComponent(
+      () =>
+        new Promise(r => {
+          resolve = r
+        }),
+    )
+
+    const reverse = ref(false)
+    const root = document.createElement('div')
+    root.innerHTML =
+      '<div><span>tail</span><!--[--><i>one</i><b>two</b><!--]--></div>'
+
+    createSSRApp({
+      render() {
+        const asyncComp = h(AsyncComp, { key: 'async' })
+        const sibling = h('span', { key: 'sibling' }, 'tail')
+        return h(
+          'div',
+          reverse.value ? [asyncComp, sibling] : [sibling, asyncComp],
+        )
+      },
+    }).mount(root)
+
+    reverse.value = true
+    await nextTick()
+    expect(root.innerHTML).toBe(
+      '<div><!--[--><i>one</i><b>two</b><!--]--><span>tail</span></div>',
+    )
+    resolve(Comp)
+    await new Promise(r => setTimeout(r))
+    expect(Comp).toHaveBeenCalled()
+    expect(root.innerHTML).toBe(
+      '<div><!--[--><i>one</i><b>two</b><!--]--><span>tail</span></div>',
+    )
+  })
+
+  test('elements with camel-case in svg ', () => {
+    const { vnode, container } = mountWithHydration(
+      '<animateTransform></animateTransform>',
+      () => h('animateTransform'),
+    )
+    expect(vnode.el).toBe(container.firstChild)
+    expect(`Hydration node mismatch`).not.toHaveBeenWarned()
+  })
+
+  test('SVG as a mount container', () => {
+    // createElement('svg') yields an HTMLUnknownElement in the XHTML
+    // namespace, so the container has to be created in the SVG namespace for
+    // this test to be about SVG at all.
+    const svgContainer = document.createElementNS(
+      'http://www.w3.org/2000/svg',
+      'svg',
+    )
+    svgContainer.innerHTML = '<g></g>'
+    const app = createSSRApp({
+      render: () => h('g'),
+    })
+
+    expect(
+      (
+        app.mount(svgContainer).$.subTree as VNode<Node, Element> & {
+          el: Element
+        }
+      ).el instanceof SVGElement,
+    ).toBe(true)
+  })
+
+  test('force hydrate prop with `.prop` modifier', () => {
+    const { container } = mountWithHydration('<input type="checkbox">', () =>
+      h('input', {
+        type: 'checkbox',
+        '.indeterminate': true,
+      }),
+    )
+    expect((container.firstChild! as any).indeterminate).toBe(true)
+  })
+
+  test('force hydrate input v-model with non-string value bindings', () => {
+    const { container } = mountWithHydration(
+      '<input type="checkbox" value="true">',
+      () =>
+        withDirectives(
+          createVNode(
+            'input',
+            { type: 'checkbox', 'true-value': true },
+            null,
+            PatchFlags.PROPS,
+            ['true-value'],
+          ),
+          [[vModelCheckbox, true]],
+        ),
+    )
+    expect((container.firstChild as any)._trueValue).toBe(true)
+  })
+
+  test('preserves text entered before v-model hydration', async () => {
+    const state = reactive({ text: 'server value' })
+    const App = {
+      setup: () => state,
+      template: `<input v-model="text">`,
+    }
+    const container = document.createElement('div')
+    container.innerHTML = await renderToString(h(App))
+    const input = container.firstChild as HTMLInputElement
+    input.value = 'user value'
+
+    createSSRApp(App).mount(container)
+    await nextTick()
+
+    expect(input.value).toBe('user value')
+    expect(state.text).toBe('user value')
+  })
+
+  test('force hydrate checkbox with indeterminate', () => {
+    const { container } = mountWithHydration(
+      '<input type="checkbox" indeterminate>',
+      () =>
+        createVNode(
+          'input',
+          { type: 'checkbox', indeterminate: '' },
+          null,
+          PatchFlags.CACHED,
+        ),
+    )
+    expect((container.firstChild as any).indeterminate).toBe(true)
+  })
+
+  test('force hydrate select option with non-string value bindings', () => {
+    const { container } = mountWithHydration(
+      '<select><option value="true">ok</option></select>',
+      () =>
+        h('select', [
+          // hoisted because bound value is a constant...
+          createVNode('option', { value: true }, null, -1 /* HOISTED */),
+        ]),
+    )
+    expect((container.firstChild!.firstChild as any)._value).toBe(true)
+  })
+
+  // #7203
+  test('force hydrate custom element with dynamic props', () => {
+    class MyElement extends HTMLElement {
+      foo = ''
+      constructor() {
+        super()
+      }
+    }
+    customElements.define('my-element-7203', MyElement)
+
+    const msg = ref('bar')
+    const container = document.createElement('div')
+    container.innerHTML = '<my-element-7203></my-element-7203>'
+    const app = createSSRApp({
+      render: () => h('my-element-7203', { foo: msg.value }),
+    })
+    app.mount(container)
+    expect((container.firstChild as any).foo).toBe(msg.value)
+  })
+
+  // #14274
+  test('should not render ref on custom element during hydration', () => {
+    const container = document.createElement('div')
+    container.innerHTML = '<my-element>hello</my-element>'
+    const root = ref()
+    const app = createSSRApp({
+      render: () =>
+        h('my-element', {
+          ref: root,
+          innerHTML: 'hello',
+        }),
+    })
+    app.mount(container)
+    expect(container.innerHTML).toBe('<my-element>hello</my-element>')
+    expect((container.firstChild as Element).hasAttribute('ref')).toBe(false)
+    expect(root.value).toBe(container.firstChild)
+  })
+
+  // #5728
+  test('empty text node in slot', () => {
+    const Comp = {
+      render(this: any) {
+        return renderSlot(this.$slots, 'default', {}, () => [
+          createTextVNode(''),
+        ])
+      },
+    }
+    const { container, vnode } = mountWithHydration('<!--[--><!--]-->', () =>
+      h(Comp),
+    )
+    expect(container.childNodes.length).toBe(3)
+    const text = container.childNodes[1]
+    expect(text.nodeType).toBe(3)
+    expect(vnode.el).toBe(container.childNodes[0])
+    // component => slot fragment => text node
+    expect((vnode as any).component?.subTree.children[0].el).toBe(text)
+  })
+
+  // #7215
+  test('empty text node', () => {
+    const Comp = {
+      render(this: any) {
+        return h('p', [''])
+      },
+    }
+    const { container } = mountWithHydration('<p></p>', () => h(Comp))
+    expect(container.childNodes.length).toBe(1)
+    const p = container.childNodes[0]
+    expect(p.childNodes.length).toBe(1)
+    const text = p.childNodes[0]
+    expect(text.nodeType).toBe(3)
+  })
+
+  // #11372
+  test('object style value tracking in prod', async () => {
+    __DEV__ = false
+    try {
+      const style = reactive({ color: 'red' })
+      const Comp = {
+        render(this: any) {
+          return (
+            openBlock(),
+            createElementBlock(
+              'div',
+              {
+                style: normalizeStyle(style),
+              },
+              null,
+              4 /* STYLE */,
+            )
+          )
+        },
+      }
+      const { container } = mountWithHydration(
+        `<div style="color: red;"></div>`,
+        () => h(Comp),
+      )
+      style.color = 'green'
+      await nextTick()
+      expect(container.innerHTML).toBe(`<div style="color: green;"></div>`)
+    } finally {
+      __DEV__ = true
+    }
+  })
+
+  test('app.unmount()', async () => {
+    const container = document.createElement('DIV')
+    container.innerHTML = '<button></button>'
+    const App = defineComponent({
+      setup(_, { expose }) {
+        const count = ref(0)
+
+        expose({ count })
+
+        return () =>
+          h('button', {
+            onClick: () => count.value++,
+          })
+      },
+    })
+
+    const app = createSSRApp(App)
+    const vm = app.mount(container)
+    await nextTick()
+    expect((container as any)._vnode).toBeDefined()
+    // @ts-expect-error - expose()'d properties are not available on vm type
+    expect(vm.count).toBe(0)
+
+    app.unmount()
+    expect((container as any)._vnode).toBe(null)
+  })
+
+  // #6637
+  test('stringified root fragment', () => {
+    mountWithHydration(`<!--[--><div></div><!--]-->`, () =>
+      createStaticVNode(`<div></div>`, 1),
+    )
+    expect(`mismatch`).not.toHaveBeenWarned()
+  })
+
+  test('transition appear', () => {
+    const { vnode, container } = mountWithHydration(
+      `<template><div>foo</div></template>`,
+      () =>
+        h(
+          Transition,
+          { appear: true },
+          {
+            default: () => h('div', 'foo'),
+          },
+        ),
+    )
+    expect(container.firstChild).toMatchInlineSnapshot(`
+      <div
+        class="v-enter-from v-enter-active"
+      >
+        foo
+      </div>
+    `)
+    expect(vnode.el).toBe(container.firstChild)
+    expect(`mismatch`).not.toHaveBeenWarned()
+  })
+
+  test('transition appear work with pre-existing class', () => {
+    const { vnode, container } = mountWithHydration(
+      `<template><div class="foo">foo</div></template>`,
+      () =>
+        h(
+          Transition,
+          { appear: true },
+          {
+            default: () => h('div', { class: 'foo' }, 'foo'),
+          },
+        ),
+    )
+    expect(container.firstChild).toMatchInlineSnapshot(`
+      <div
+        class="foo v-enter-from v-enter-active"
+      >
+        foo
+      </div>
+    `)
+    expect(vnode.el).toBe(container.firstChild)
+    expect(`mismatch`).not.toHaveBeenWarned()
+  })
+
+  // #13394
+  test('transition appear work with empty content', async () => {
+    const show = ref(true)
+    const { vnode, container } = mountWithHydration(
+      `<template><!----></template>`,
+      function (this: any) {
+        return h(
+          Transition,
+          { appear: true },
+          {
+            default: () =>
+              show.value
+                ? renderSlot(this.$slots, 'default')
+                : createTextVNode('foo'),
+          },
+        )
+      },
+    )
+
+    // empty slot render as a comment node
+    expect(container.firstChild!.nodeType).toBe(Node.COMMENT_NODE)
+    expect(vnode.el).toBe(container.firstChild)
+    expect(`mismatch`).not.toHaveBeenWarned()
+
+    show.value = false
+    await nextTick()
+    expect(container.innerHTML).toBe('foo')
+  })
+
+  test('transition appear with v-if', () => {
+    const show = false
+    const { vnode, container } = mountWithHydration(
+      `<template><!----></template>`,
+      () =>
+        h(
+          Transition,
+          { appear: true },
+          {
+            default: () => (show ? h('div', 'foo') : createCommentVNode('')),
+          },
+        ),
+    )
+    expect(container.firstChild).toMatchInlineSnapshot('<!---->')
+    expect(vnode.el).toBe(container.firstChild)
+    expect(`mismatch`).not.toHaveBeenWarned()
+  })
+
+  test('transition appear with v-show', () => {
+    const show = false
+    const { vnode, container } = mountWithHydration(
+      `<template><div style="display: none;">foo</div></template>`,
+      () =>
+        h(
+          Transition,
+          { appear: true },
+          {
+            default: () =>
+              withDirectives(createVNode('div', null, 'foo'), [[vShow, show]]),
+          },
+        ),
+    )
+    expect(container.firstChild).toMatchInlineSnapshot(`
+      <div
+        class="v-enter-from v-enter-active"
+        style="display: none;"
+      >
+        foo
+      </div>
+    `)
+    expect((container.firstChild as any)[vShowOriginalDisplay]).toBe('')
+    expect(vnode.el).toBe(container.firstChild)
+    expect(`mismatch`).not.toHaveBeenWarned()
+  })
+
+  test('transition appear w/ event listener', async () => {
+    const container = document.createElement('div')
+    container.innerHTML = `<template><button>0</button></template>`
+    createSSRApp({
+      data() {
+        return {
+          count: 0,
+        }
+      },
+      template: `
+        <Transition appear>
+          <button @click="count++">{{count}}</button>
+        </Transition>
+      `,
+    }).mount(container)
+
+    expect(container.firstChild).toMatchInlineSnapshot(`
+      <button
+        class="v-enter-from v-enter-active"
+      >
+        0
+      </button>
+    `)
+
+    triggerEvent('click', container.querySelector('button')!)
+    await nextTick()
+    expect(container.firstChild).toMatchInlineSnapshot(`
+      <button
+        class="v-enter-from v-enter-active"
+      >
+        1
+      </button>
+    `)
+  })
+
+  test('Suspense + transition appear', async () => {
+    const { vnode, container } = mountWithHydration(
+      `<template><div>foo</div></template>`,
+      () =>
+        h(Suspense, {}, () =>
+          h(
+            Transition,
+            { appear: true },
+            {
+              default: () => h('div', 'foo'),
+            },
+          ),
+        ),
+    )
+
+    expect(vnode.el).toBe(container.firstChild)
+    // wait for hydration to finish
+    await new Promise(r => setTimeout(r))
+
+    expect(container.firstChild).toMatchInlineSnapshot(`
+      <div
+        class="v-enter-from v-enter-active"
+      >
+        foo
+      </div>
+    `)
+    await nextTick()
+    expect(vnode.el).toBe(container.firstChild)
+  })
+
+  // #10607
+  test('update component stable slot (prod + optimized mode)', async () => {
+    __DEV__ = false
+    try {
+      const container = document.createElement('div')
+      container.innerHTML = `<template><div show="false"><!--[--><div><div><!----></div></div><div>0</div><!--]--></div></template>`
+      const Comp = {
+        render(this: any) {
+          return (
+            openBlock(),
+            createElementBlock('div', null, [
+              renderSlot(this.$slots, 'default'),
+            ])
+          )
+        },
+      }
+      const show = ref(false)
+      const clicked = ref(false)
+
+      const Wrapper = {
+        setup() {
+          const items = ref<number[]>([])
+          onMounted(() => {
+            items.value = [1]
+          })
+          return () => {
+            return (
+              openBlock(),
+              createBlock(Comp, null, {
+                default: withCtx(() => [
+                  createElementVNode('div', null, [
+                    createElementVNode('div', null, [
+                      clicked.value
+                        ? (openBlock(),
+                          createElementBlock('div', { key: 0 }, 'foo'))
+                        : createCommentVNode('v-if', true),
+                    ]),
+                  ]),
+                  createElementVNode(
+                    'div',
+                    null,
+                    items.value.length,
+                    1 /* TEXT */,
+                  ),
+                ]),
+                _: 1 /* STABLE */,
+              })
+            )
+          }
+        },
+      }
+      createSSRApp({
+        components: { Wrapper },
+        data() {
+          return { show }
+        },
+        template: `<Wrapper :show="show"/>`,
+      }).mount(container)
+
+      await nextTick()
+      expect(container.innerHTML).toBe(
+        `<div show="false"><!--[--><div><div><!----></div></div><div>1</div><!--]--></div>`,
+      )
+
+      show.value = true
+      await nextTick()
+      expect(async () => {
+        clicked.value = true
+        await nextTick()
+      }).not.toThrow("Cannot read properties of null (reading 'insertBefore')")
+
+      await nextTick()
+      expect(container.innerHTML).toBe(
+        `<div show="true"><!--[--><div><div><div>foo</div></div></div><div>1</div><!--]--></div>`,
+      )
+    } catch (e) {
+      throw e
+    } finally {
+      __DEV__ = true
+    }
+  })
+
+  test('hmr reload child wrapped in KeepAlive', async () => {
+    const id = 'child-reload'
+    const Child = {
+      __hmrId: id,
+      template: `<div>foo</div>`,
+    }
+    createRecord(id, Child)
+
+    const appId = 'test-app-id'
+    const App = {
+      __hmrId: appId,
+      components: { Child },
+      template: `
+      <div>
+        <KeepAlive>
+          <Child />
+        </KeepAlive>
+      </div>
+      `,
+    }
+
+    const root = document.createElement('div')
+    root.innerHTML = await renderToString(h(App))
+    createSSRApp(App).mount(root)
+    expect(root.innerHTML).toBe('<div><div>foo</div></div>')
+
+    reload(id, {
+      __hmrId: id,
+      template: `<div>bar</div>`,
+    })
+    await nextTick()
+    expect(root.innerHTML).toBe('<div><div>bar</div></div>')
+  })
+
+  test('hmr root reload', async () => {
+    const appId = 'test-app-id'
+    const App = {
+      __hmrId: appId,
+      template: `<div>foo</div>`,
+    }
+
+    const root = document.createElement('div')
+    root.innerHTML = await renderToString(h(App))
+    createSSRApp(App).mount(root)
+    expect(root.innerHTML).toBe('<div>foo</div>')
+
+    reload(appId, {
+      __hmrId: appId,
+      template: `<div>bar</div>`,
+    })
+    await nextTick()
+    expect(root.innerHTML).toBe('<div>bar</div>')
+  })
+
+  describe('mismatch handling', () => {
+    test('text node', () => {
+      const { container } = mountWithHydration(`foo`, () => 'bar')
+      expect(container.textContent).toBe('bar')
+      expect(`Hydration text mismatch`).toHaveBeenWarned()
+    })
+
+    test('element text content', () => {
+      const { container } = mountWithHydration(`<div>foo</div>`, () =>
+        h('div', 'bar'),
+      )
+      expect(container.innerHTML).toBe('<div>bar</div>')
+      expect(`Hydration text content mismatch`).toHaveBeenWarned()
+    })
+
+    test('not enough children', () => {
+      const { container } = mountWithHydration(`<div></div>`, () =>
+        h('div', [h('span', 'foo'), h('span', 'bar')]),
+      )
+      expect(container.innerHTML).toBe(
+        '<div><span>foo</span><span>bar</span></div>',
+      )
+      expect(`Hydration children mismatch`).toHaveBeenWarned()
+    })
+
+    test('too many children', () => {
+      const { container } = mountWithHydration(
+        `<div><span>foo</span><span>bar</span></div>`,
+        () => h('div', [h('span', 'foo')]),
+      )
+      expect(container.innerHTML).toBe('<div><span>foo</span></div>')
+      expect(`Hydration children mismatch`).toHaveBeenWarned()
+    })
+
+    test('children mismatch is checked once when removing excess nodes', () => {
+      const hasAttribute = vi.spyOn(Element.prototype, 'hasAttribute')
+
+      try {
+        const { container } = mountWithHydration(
+          `<div><span>foo</span><span>bar</span><span>baz</span></div>`,
+          () => h('div', [h('span', 'foo')]),
+        )
+        const el = container.firstChild as Element
+        const allowMismatchCheckCount = hasAttribute.mock.calls.filter(
+          ([key], i) =>
+            key === 'data-allow-mismatch' &&
+            hasAttribute.mock.contexts[i] === el,
+        ).length
+
+        expect(container.innerHTML).toBe('<div><span>foo</span></div>')
+        expect(`Hydration children mismatch`).toHaveBeenWarnedTimes(1)
+        expect(allowMismatchCheckCount).toBe(1)
+      } finally {
+        hasAttribute.mockRestore()
+      }
+    })
+
+    test('children mismatch is checked once when mounting missing nodes', () => {
+      const hasAttribute = vi.spyOn(Element.prototype, 'hasAttribute')
+
+      try {
+        const { container } = mountWithHydration(`<div></div>`, () =>
+          h('div', [h('span', 'foo'), h('span', 'bar'), h('span', 'baz')]),
+        )
+        const el = container.firstChild as Element
+        const allowMismatchCheckCount = hasAttribute.mock.calls.filter(
+          ([key], i) =>
+            key === 'data-allow-mismatch' &&
+            hasAttribute.mock.contexts[i] === el,
+        ).length
+
+        expect(container.innerHTML).toBe(
+          '<div><span>foo</span><span>bar</span><span>baz</span></div>',
+        )
+        expect(`Hydration children mismatch`).toHaveBeenWarnedTimes(1)
+        expect(allowMismatchCheckCount).toBe(1)
+      } finally {
+        hasAttribute.mockRestore()
+      }
+    })
+
+    test('complete mismatch', () => {
+      const { container } = mountWithHydration(
+        `<div><span>foo</span><span>bar</span></div>`,
+        () => h('div', [h('div', 'foo'), h('p', 'bar')]),
+      )
+      expect(container.innerHTML).toBe('<div><div>foo</div><p>bar</p></div>')
+      expect(`Hydration node mismatch`).toHaveBeenWarnedTimes(2)
+    })
+
+    test('fragment mismatch removal', () => {
+      const { container } = mountWithHydration(
+        `<div><!--[--><div>foo</div><div>bar</div><!--]--></div>`,
+        () => h('div', [h('span', 'replaced')]),
+      )
+      expect(container.innerHTML).toBe('<div><span>replaced</span></div>')
+      expect(`Hydration node mismatch`).toHaveBeenWarned()
+    })
+
+    test('fragment not enough children', () => {
+      const { container } = mountWithHydration(
+        `<div><!--[--><div>foo</div><!--]--><div>baz</div></div>`,
+        () => h('div', [[h('div', 'foo'), h('div', 'bar')], h('div', 'baz')]),
+      )
+      expect(container.innerHTML).toBe(
+        '<div><!--[--><div>foo</div><div>bar</div><!--]--><div>baz</div></div>',
+      )
+      expect(`Hydration node mismatch`).toHaveBeenWarned()
+    })
+
+    test('fragment too many children', () => {
+      const { container } = mountWithHydration(
+        `<div><!--[--><div>foo</div><div>bar</div><!--]--><div>baz</div></div>`,
+        () => h('div', [[h('div', 'foo')], h('div', 'baz')]),
+      )
+      expect(container.innerHTML).toBe(
+        '<div><!--[--><div>foo</div><!--]--><div>baz</div></div>',
+      )
+      // fragment ends early and attempts to hydrate the extra <div>bar</div>
+      // as 2nd fragment child.
+      expect(`Hydration text content mismatch`).toHaveBeenWarned()
+      // excessive children removal
+      expect(`Hydration children mismatch`).toHaveBeenWarned()
+    })
+
+    test('Teleport target has empty children', () => {
+      const teleportContainer = document.createElement('div')
+      teleportContainer.id = 'teleport'
+      document.body.appendChild(teleportContainer)
+
+      mountWithHydration('<!--teleport start--><!--teleport end-->', () =>
+        h(Teleport, { to: '#teleport' }, [h('span', 'value')]),
+      )
+      expect(teleportContainer.innerHTML).toBe(`<span>value</span>`)
+      expect(`Hydration children mismatch`).toHaveBeenWarned()
+    })
+
+    test('comment mismatch (element)', () => {
+      const { container } = mountWithHydration(`<div><span></span></div>`, () =>
+        h('div', [createCommentVNode('hi')]),
+      )
+      expect(container.innerHTML).toBe('<div><!--hi--></div>')
+      expect(`Hydration node mismatch`).toHaveBeenWarned()
+    })
+
+    test('comment mismatch (text)', () => {
+      const { container } = mountWithHydration(`<div>foobar</div>`, () =>
+        h('div', [createCommentVNode('hi')]),
+      )
+      expect(container.innerHTML).toBe('<div><!--hi--></div>')
+      expect(`Hydration node mismatch`).toHaveBeenWarned()
+    })
+
+    test('class mismatch', () => {
+      mountWithHydration(`<div class="foo bar"></div>`, () =>
+        h('div', { class: ['foo', 'bar'] }),
+      )
+      mountWithHydration(`<div class="foo bar"></div>`, () =>
+        h('div', { class: { foo: true, bar: true } }),
+      )
+      mountWithHydration(`<div class="foo bar"></div>`, () =>
+        h('div', { class: 'foo bar' }),
+      )
+      // SVG classes
+      mountWithHydration(`<svg class="foo bar"></svg>`, () =>
+        h('svg', { class: 'foo bar' }),
+      )
+      // class with different order
+      mountWithHydration(`<div class="foo bar"></div>`, () =>
+        h('div', { class: 'bar foo' }),
+      )
+      expect(`Hydration class mismatch`).not.toHaveBeenWarned()
+      mountWithHydration(`<div class="foo bar"></div>`, () =>
+        h('div', { class: 'foo' }),
+      )
+      expect(`Hydration class mismatch`).toHaveBeenWarned()
+    })
+
+    test('style mismatch', () => {
+      mountWithHydration(`<div style="color:red;"></div>`, () =>
+        h('div', { style: { color: 'red' } }),
+      )
+      mountWithHydration(`<div style="color:red;"></div>`, () =>
+        h('div', { style: `color:red;` }),
+      )
+      mountWithHydration(
+        `<div style="color:red; font-size: 12px;"></div>`,
+        () => h('div', { style: `font-size: 12px; color:red;` }),
+      )
+      mountWithHydration(`<div style="color:red;display:none;"></div>`, () =>
+        withDirectives(createVNode('div', { style: 'color: red' }, ''), [
+          [vShow, false],
+        ]),
+      )
+      expect(`Hydration style mismatch`).not.toHaveBeenWarned()
+      mountWithHydration(`<div style="color:red;"></div>`, () =>
+        h('div', { style: { color: 'green' } }),
+      )
+      expect(`Hydration style mismatch`).toHaveBeenWarnedTimes(1)
+    })
+
+    test('style mismatch when no style attribute is present', () => {
+      mountWithHydration(`<div></div>`, () =>
+        h('div', { style: { color: 'red' } }),
+      )
+      expect(`Hydration style mismatch`).toHaveBeenWarnedTimes(1)
+    })
+
+    test('style mismatch w/ v-show', () => {
+      mountWithHydration(`<div style="color:red;display:none"></div>`, () =>
+        withDirectives(createVNode('div', { style: 'color: red' }, ''), [
+          [vShow, false],
+        ]),
+      )
+      expect(`Hydration style mismatch`).not.toHaveBeenWarned()
+      mountWithHydration(`<div style="color:red;"></div>`, () =>
+        withDirectives(createVNode('div', { style: 'color: red' }, ''), [
+          [vShow, false],
+        ]),
+      )
+      expect(`Hydration style mismatch`).toHaveBeenWarnedTimes(1)
+    })
+
+    test('attr mismatch', () => {
+      mountWithHydration(`<div id="foo"></div>`, () => h('div', { id: 'foo' }))
+      mountWithHydration(`<div spellcheck></div>`, () =>
+        h('div', { spellcheck: '' }),
+      )
+      mountWithHydration(`<div></div>`, () => h('div', { id: undefined }))
+      // boolean
+      mountWithHydration(`<select multiple></div>`, () =>
+        h('select', { multiple: true }),
+      )
+      mountWithHydration(`<select multiple></div>`, () =>
+        h('select', { multiple: 'multiple' }),
+      )
+      expect(`Hydration attribute mismatch`).not.toHaveBeenWarned()
+
+      mountWithHydration(`<div></div>`, () => h('div', { id: 'foo' }))
+      expect(`Hydration attribute mismatch`).toHaveBeenWarnedTimes(1)
+
+      mountWithHydration(`<div id="bar"></div>`, () => h('div', { id: 'foo' }))
+      expect(`Hydration attribute mismatch`).toHaveBeenWarnedTimes(2)
+    })
+
+    test('attr special case: textarea value', () => {
+      mountWithHydration(`<textarea>foo</textarea>`, () =>
+        h('textarea', { value: 'foo' }),
+      )
+      mountWithHydration(`<textarea></textarea>`, () =>
+        h('textarea', { value: '' }),
+      )
+      expect(`Hydration attribute mismatch`).not.toHaveBeenWarned()
+
+      mountWithHydration(`<textarea>foo</textarea>`, () =>
+        h('textarea', { value: 'bar' }),
+      )
+      expect(`Hydration attribute mismatch`).toHaveBeenWarned()
+    })
+
+    // #11873
+    test('<textarea> with newlines at the beginning', async () => {
+      const render = () => h('textarea', null, '\nhello')
+      const html = await renderToString(createSSRApp({ render }))
+      mountWithHydration(html, render)
+      expect(`Hydration text content mismatch`).not.toHaveBeenWarned()
+    })
+
+    test('<pre> with newlines at the beginning', async () => {
+      const render = () => h('pre', null, '\n')
+      const html = await renderToString(createSSRApp({ render }))
+      mountWithHydration(html, render)
+      expect(`Hydration text content mismatch`).not.toHaveBeenWarned()
+    })
+
+    test('boolean attr handling', () => {
+      mountWithHydration(`<input />`, () => h('input', { readonly: false }))
+      expect(`Hydration attribute mismatch`).not.toHaveBeenWarned()
+
+      mountWithHydration(`<input readonly />`, () =>
+        h('input', { readonly: true }),
+      )
+      expect(`Hydration attribute mismatch`).not.toHaveBeenWarned()
+
+      mountWithHydration(`<input readonly="readonly" />`, () =>
+        h('input', { readonly: true }),
+      )
+      expect(`Hydration attribute mismatch`).not.toHaveBeenWarned()
+    })
+
+    test('hidden enumerated attribute', () => {
+      mountWithHydration(`<div></div>`, () => h('div', { hidden: false }))
+      expect(`Hydration attribute mismatch`).not.toHaveBeenWarned()
+
+      mountWithHydration(`<div hidden></div>`, () => h('div', { hidden: true }))
+      expect(`Hydration attribute mismatch`).not.toHaveBeenWarned()
+
+      mountWithHydration(`<div hidden></div>`, () =>
+        h('div', { hidden: 'hidden' }),
+      )
+      expect(`Hydration attribute mismatch`).not.toHaveBeenWarned()
+
+      mountWithHydration(`<div hidden="anything"></div>`, () =>
+        h('div', { hidden: true }),
+      )
+      expect(`Hydration attribute mismatch`).not.toHaveBeenWarned()
+
+      mountWithHydration(`<div hidden="until-found"></div>`, () =>
+        h('div', { hidden: 'until-found' }),
+      )
+      expect(`Hydration attribute mismatch`).not.toHaveBeenWarned()
+
+      mountWithHydration(`<div hidden="UNTIL-FOUND"></div>`, () =>
+        h('div', { hidden: 'until-found' }),
+      )
+      expect(`Hydration attribute mismatch`).not.toHaveBeenWarned()
+    })
+
+    test('hidden numeric values', () => {
+      mountWithHydration(`<div></div>`, () => h('div', { hidden: 0 }))
+      expect(`Hydration attribute mismatch`).not.toHaveBeenWarned()
+
+      mountWithHydration(`<div></div>`, () => h('div', { hidden: NaN }))
+      expect(`Hydration attribute mismatch`).not.toHaveBeenWarned()
+
+      mountWithHydration(`<div hidden></div>`, () => h('div', { hidden: 1 }))
+      expect(`Hydration attribute mismatch`).not.toHaveBeenWarned()
+
+      mountWithHydration(`<div hidden="0"></div>`, () =>
+        h('div', { hidden: '0' }),
+      )
+      expect(`Hydration attribute mismatch`).not.toHaveBeenWarned()
+    })
+
+    test('hidden state mismatch', () => {
+      mountWithHydration(`<div hidden="until-found"></div>`, () =>
+        h('div', { hidden: true }),
+      )
+      expect(`Hydration attribute mismatch`).toHaveBeenWarnedTimes(1)
+
+      mountWithHydration(`<div hidden></div>`, () => h('div', { hidden: 0 }))
+      expect(`Hydration attribute mismatch`).toHaveBeenWarnedTimes(2)
+    })
+
+    test('client value is null or undefined', () => {
+      mountWithHydration(`<div></div>`, () =>
+        h('div', { draggable: undefined }),
+      )
+      expect(`Hydration attribute mismatch`).not.toHaveBeenWarned()
+
+      mountWithHydration(`<input />`, () => h('input', { type: null }))
+      expect(`Hydration attribute mismatch`).not.toHaveBeenWarned()
+    })
+
+    test('should not warn against object values', () => {
+      mountWithHydration(`<input />`, () => h('input', { from: {} }))
+      expect(`Hydration attribute mismatch`).not.toHaveBeenWarned()
+    })
+
+    test('should not warn on falsy bindings of non-property keys', () => {
+      mountWithHydration(`<button />`, () => h('button', { href: undefined }))
+      expect(`Hydration attribute mismatch`).not.toHaveBeenWarned()
+    })
+
+    test('should not warn on non-renderable option values', () => {
+      mountWithHydration(`<select><option>hello</option></select>`, () =>
+        h('select', [h('option', { value: ['foo'] }, 'hello')]),
+      )
+      expect(`Hydration attribute mismatch`).not.toHaveBeenWarned()
+    })
+
+    test('should not warn css v-bind', () => {
+      const container = document.createElement('div')
+      container.innerHTML = `<div style="--foo:red;color:var(--foo);" />`
+      const app = createSSRApp({
+        setup() {
+          useCssVars(() => ({
+            foo: 'red',
+          }))
+          return () => h('div', { style: { color: 'var(--foo)' } })
+        },
+      })
+      app.mount(container)
+      expect(`Hydration style mismatch`).not.toHaveBeenWarned()
+    })
+
+    // #10317 - test case from #10325
+    test('css vars should only be added to expected on component root dom', () => {
+      const container = document.createElement('div')
+      container.innerHTML = `<div style="--foo:red;"><div style="color:var(--foo);" /></div>`
+      const app = createSSRApp({
+        setup() {
+          useCssVars(() => ({
+            foo: 'red',
+          }))
+          return () =>
+            h('div', null, [h('div', { style: { color: 'var(--foo)' } })])
+        },
+      })
+      app.mount(container)
+      expect(`Hydration style mismatch`).not.toHaveBeenWarned()
+    })
+
+    // #11188
+    test('css vars support fallthrough', () => {
+      const container = document.createElement('div')
+      container.innerHTML = `<div style="padding: 4px;--foo:red;"></div>`
+      const app = createSSRApp({
+        setup() {
+          useCssVars(() => ({
+            foo: 'red',
+          }))
+          return () => h(Child)
+        },
+      })
+      const Child = {
+        setup() {
+          return () => h('div', { style: 'padding: 4px' })
+        },
+      }
+      app.mount(container)
+      expect(`Hydration style mismatch`).not.toHaveBeenWarned()
+    })
+
+    // #11189
+    test('should not warn for directives that mutate DOM in created', () => {
+      const container = document.createElement('div')
+      container.innerHTML = `<div class="test red"></div>`
+      const vColor: ObjectDirective = {
+        created(el, binding) {
+          el.classList.add(binding.value)
+        },
+      }
+      const app = createSSRApp({
+        setup() {
+          return () =>
+            withDirectives(h('div', { class: 'test' }), [[vColor, 'red']])
+        },
+      })
+      app.mount(container)
+      expect(`Hydration style mismatch`).not.toHaveBeenWarned()
+    })
+
+    test('with disabled teleport + undefined target', async () => {
+      const container = document.createElement('div')
+      const isOpen = ref(false)
+      const App = {
+        setup() {
+          return { isOpen }
+        },
+        template: `
+          <Teleport :to="undefined" :disabled="true">
+            <div v-if="isOpen">
+              Menu is open...
+            </div>
+          </Teleport>`,
+      }
+      container.innerHTML = await renderToString(h(App))
+      const app = createSSRApp(App)
+      app.mount(container)
+      isOpen.value = true
+      await nextTick()
+      expect(container.innerHTML).toBe(
+        `<!--teleport start--><div> Menu is open... </div><!--teleport end-->`,
+      )
+    })
+
+    test('escape css var name', () => {
+      const container = document.createElement('div')
+      container.innerHTML = `<div style="padding: 4px;--foo\\.bar:red;"></div>`
+      const app = createSSRApp({
+        setup() {
+          useCssVars(() => ({
+            'foo.bar': 'red',
+          }))
+          return () => h(Child)
+        },
+      })
+      const Child = {
+        setup() {
+          return () => h('div', { style: 'padding: 4px' })
+        },
+      }
+      app.mount(container)
+      expect(`Hydration style mismatch`).not.toHaveBeenWarned()
+    })
+
+    test('nested mismatch should not change the component el', async () => {
+      const PageA = {
+        setup() {
+          const show = ref(true)
+          onServerPrefetch(() => (show.value = false))
+          return { show }
+        },
+        template: `<main><p><button v-if="show">btn</button></p>A</main>`,
+      }
+      const PageB = {
+        template: `<section>B</section>`,
+      }
+      const page = shallowRef<Component>(PageA)
+      const App = {
+        setup() {
+          return { page }
+        },
+        template: `<div><component :is="page" /><footer>footer</footer></div>`,
+      }
+
+      const container = document.createElement('div')
+      container.innerHTML = await renderToString(h(App))
+      createSSRApp(App).mount(container)
+      expect(`Hydration node mismatch`).toHaveBeenWarned()
+      expect(container.innerHTML).toBe(
+        '<div><main><p><button>btn</button></p>A</main><footer>footer</footer></div>',
+      )
+
+      page.value = PageB
+      await nextTick()
+      expect(container.innerHTML).toBe(
+        '<div><section>B</section><footer>footer</footer></div>',
+      )
+    })
+
+    test('nested mismatch should not change the component el with Suspense', async () => {
+      const PageA = {
+        setup() {
+          const show = ref(true)
+          onServerPrefetch(() => (show.value = false))
+          return { show }
+        },
+        template: `<main><p><button v-if="show">btn</button></p>A</main>`,
+      }
+      const PageB = {
+        template: `<section>B</section>`,
+      }
+      const page = shallowRef<Component>(PageA)
+      const App = {
+        setup() {
+          return { page }
+        },
+        template: `<div><Suspense><component :is="page" /></Suspense><footer>footer</footer></div>`,
+      }
+
+      const container = document.createElement('div')
+      container.innerHTML = await renderToString(h(App))
+      createSSRApp(App).mount(container)
+      await nextTick()
+      expect(`Hydration node mismatch`).toHaveBeenWarned()
+      expect(container.innerHTML).toBe(
+        '<div><main><p><button>btn</button></p>A</main><footer>footer</footer></div>',
+      )
+
+      page.value = PageB
+      await nextTick()
+      await nextTick()
+      expect(container.innerHTML).toBe(
+        '<div><section>B</section><footer>footer</footer></div>',
+      )
+    })
+  })
+
+  test('root mismatch with pending Suspense should preserve the component el', async () => {
+    const { container, ssrHtml, page, pageRef, onResolve, release } =
+      await hydrateSuspenseApp(gate => {
+        const onResolve = vi.fn()
+        const AsyncChild = {
+          async setup() {
+            await gate()
+            return {}
+          },
+          template: `<span>async</span>`,
+        }
+        const PageA = {
+          components: { AsyncChild },
+          setup() {
+            const show = ref(true)
+            onServerPrefetch(() => (show.value = false))
+            return { show, onResolve }
+          },
+          template: `
+            <Suspense @resolve="onResolve">
+              <main v-if="show"><AsyncChild /></main>
+              <section v-else><AsyncChild /></section>
+            </Suspense>
+          `,
+        }
+        const page = shallowRef<Component>(PageA)
+        const pageRef = ref<ComponentPublicInstance>()
+        const App = {
+          setup() {
+            return { page, pageRef }
+          },
+          template: `<div><component :is="page" ref="pageRef" /></div>`,
+        }
+        return { App, page, pageRef, onResolve }
+      })
+
+    expect(ssrHtml).toBe('<div><section><span>async</span></section></div>')
+    expect(`Hydration node mismatch`).toHaveBeenWarned()
+    expect(onResolve).not.toHaveBeenCalled()
+    expect(container.innerHTML).toBe('<div><main><!----></main></div>')
+    expect.soft(pageRef.value!.$el).toBe(container.querySelector('main'))
+
+    page.value = { template: `<article>B</article>` }
+    await nextTick()
+    expect(container.innerHTML).toBe('<div><article>B</article></div>')
+
+    release()
+    await new Promise(r => setTimeout(r))
+    expect(container.innerHTML).toBe('<div><article>B</article></div>')
+  })
+
+  describe('data-allow-mismatch', () => {
+    test('element text content', () => {
+      const { container } = mountWithHydration(
+        `<div data-allow-mismatch="text">foo</div>`,
+        () => h('div', 'bar'),
+      )
+      expect(container.innerHTML).toBe(
+        '<div data-allow-mismatch="text">bar</div>',
+      )
+      expect(`Hydration text content mismatch`).not.toHaveBeenWarned()
+    })
+
+    test('not enough children', () => {
+      const { container } = mountWithHydration(
+        `<div data-allow-mismatch="children"></div>`,
+        () => h('div', [h('span', 'foo'), h('span', 'bar')]),
+      )
+      expect(container.innerHTML).toBe(
+        '<div data-allow-mismatch="children"><span>foo</span><span>bar</span></div>',
+      )
+      expect(`Hydration children mismatch`).not.toHaveBeenWarned()
+    })
+
+    test('too many children', () => {
+      const { container } = mountWithHydration(
+        `<div data-allow-mismatch="children"><span>foo</span><span>bar</span></div>`,
+        () => h('div', [h('span', 'foo')]),
+      )
+      expect(container.innerHTML).toBe(
+        '<div data-allow-mismatch="children"><span>foo</span></div>',
+      )
+      expect(`Hydration children mismatch`).not.toHaveBeenWarned()
+    })
+
+    test('complete mismatch', () => {
+      const { container } = mountWithHydration(
+        `<div data-allow-mismatch="children"><span>foo</span><span>bar</span></div>`,
+        () => h('div', [h('div', 'foo'), h('p', 'bar')]),
+      )
+      expect(container.innerHTML).toBe(
+        '<div data-allow-mismatch="children"><div>foo</div><p>bar</p></div>',
+      )
+      expect(`Hydration node mismatch`).not.toHaveBeenWarned()
+    })
+
+    test('fragment mismatch removal', () => {
+      const { container } = mountWithHydration(
+        `<div data-allow-mismatch="children"><!--[--><div>foo</div><div>bar</div><!--]--></div>`,
+        () => h('div', [h('span', 'replaced')]),
+      )
+      expect(container.innerHTML).toBe(
+        '<div data-allow-mismatch="children"><span>replaced</span></div>',
+      )
+      expect(`Hydration node mismatch`).not.toHaveBeenWarned()
+    })
+
+    test('fragment not enough children', () => {
+      const { container } = mountWithHydration(
+        `<div data-allow-mismatch="children"><!--[--><div>foo</div><!--]--><div>baz</div></div>`,
+        () => h('div', [[h('div', 'foo'), h('div', 'bar')], h('div', 'baz')]),
+      )
+      expect(container.innerHTML).toBe(
+        '<div data-allow-mismatch="children"><!--[--><div>foo</div><div>bar</div><!--]--><div>baz</div></div>',
+      )
+      expect(`Hydration node mismatch`).not.toHaveBeenWarned()
+    })
+
+    test('fragment too many children', () => {
+      const { container } = mountWithHydration(
+        `<div data-allow-mismatch="children"><!--[--><div>foo</div><div>bar</div><!--]--><div>baz</div></div>`,
+        () => h('div', [[h('div', 'foo')], h('div', 'baz')]),
+      )
+      expect(container.innerHTML).toBe(
+        '<div data-allow-mismatch="children"><!--[--><div>foo</div><!--]--><div>baz</div></div>',
+      )
+      // fragment ends early and attempts to hydrate the extra <div>bar</div>
+      // as 2nd fragment child.
+      expect(`Hydration text content mismatch`).not.toHaveBeenWarned()
+      // excessive children removal
+      expect(`Hydration children mismatch`).not.toHaveBeenWarned()
+    })
+
+    test('comment mismatch (element)', () => {
+      const { container } = mountWithHydration(
+        `<div data-allow-mismatch="children"><span></span></div>`,
+        () => h('div', [createCommentVNode('hi')]),
+      )
+      expect(container.innerHTML).toBe(
+        '<div data-allow-mismatch="children"><!--hi--></div>',
+      )
+      expect(`Hydration node mismatch`).not.toHaveBeenWarned()
+    })
+
+    test('comment mismatch (v-if)', () => {
+      const { container } = mountWithHydration(`<!--v-if-->`, () =>
+        h('div', { 'data-allow-mismatch': '' }, [h('span', 'value')]),
+      )
+      expect(container.innerHTML).toBe(
+        '<div data-allow-mismatch=""><span>value</span></div>',
+      )
+      expect(`Hydration node mismatch`).not.toHaveBeenWarned()
+    })
+
+    test('comment mismatch (v-if branch removed)', () => {
+      const { container } = mountWithHydration(
+        `<div data-allow-mismatch=""><span>value</span></div>`,
+        () => createCommentVNode('v-if', true),
+      )
+      expect(container.innerHTML).toBe('<!--v-if-->')
+      expect(`Hydration node mismatch`).not.toHaveBeenWarned()
+    })
+
+    test('node mismatch (v-else branches)', () => {
+      const { container } = mountWithHydration(
+        `<span data-allow-mismatch="">server</span>`,
+        () => h('div', { 'data-allow-mismatch': '' }, 'client'),
+      )
+      expect(container.innerHTML).toBe(
+        '<div data-allow-mismatch="">client</div>',
+      )
+      expect(`Hydration node mismatch`).not.toHaveBeenWarned()
+    })
+
+    test('comment mismatch (v-if) only allows children mismatches', () => {
+      const { container } = mountWithHydration(`<!--v-if-->`, () =>
+        h('div', { 'data-allow-mismatch': 'class' }, [h('span', 'value')]),
+      )
+      expect(container.innerHTML).toBe(
+        '<div data-allow-mismatch="class"><span>value</span></div>',
+      )
+      expect(`Hydration node mismatch`).toHaveBeenWarned()
+    })
+
+    test('comment mismatch (text)', () => {
+      const { container } = mountWithHydration(
+        `<div data-allow-mismatch="children">foobar</div>`,
+        () => h('div', [createCommentVNode('hi')]),
+      )
+      expect(container.innerHTML).toBe(
+        '<div data-allow-mismatch="children"><!--hi--></div>',
+      )
+      expect(`Hydration node mismatch`).not.toHaveBeenWarned()
+    })
+
+    test('class mismatch', () => {
+      mountWithHydration(
+        `<div class="foo bar" data-allow-mismatch="class"></div>`,
+        () => h('div', { class: 'foo' }),
+      )
+      expect(`Hydration class mismatch`).not.toHaveBeenWarned()
+    })
+
+    test('style mismatch', () => {
+      mountWithHydration(
+        `<div style="color:red;" data-allow-mismatch="style"></div>`,
+        () => h('div', { style: { color: 'green' } }),
+      )
+      expect(`Hydration style mismatch`).not.toHaveBeenWarned()
+    })
+
+    test('attr mismatch', () => {
+      mountWithHydration(`<div data-allow-mismatch="attribute"></div>`, () =>
+        h('div', { id: 'foo' }),
+      )
+      mountWithHydration(
+        `<div id="bar" data-allow-mismatch="attribute"></div>`,
+        () => h('div', { id: 'foo' }),
+      )
+      expect(`Hydration attribute mismatch`).not.toHaveBeenWarned()
+    })
+
+    // #9033
+    test('force patch dynamic props when hydrating', () => {
+      __DEV__ = false
+      try {
+        const { container } = mountWithHydration(
+          `<div><div>server</div></div>`,
+          () => (
+            openBlock(),
+            createElementBlock('div', null, [
+              createElementVNode(
+                'div',
+                { innerHTML: 'client' },
+                null,
+                PatchFlags.PROPS,
+                ['innerHTML'],
+              ),
+            ])
+          ),
+        )
+        expect(container.innerHTML).toBe(`<div><div>client</div></div>`)
+      } finally {
+        __DEV__ = true
+      }
+    })
+
+    test('does not re-write unchanged resource props when hydrating', () => {
+      __DEV__ = false
+      try {
+        const container = document.createElement('div')
+        container.innerHTML = `<img src="/foo.png">`
+        const el = container.firstChild as HTMLImageElement
+        const setSrc = vi.fn()
+        Object.defineProperty(el, 'src', {
+          configurable: true,
+          get: () => el.getAttribute('src'),
+          set: setSrc,
+        })
+        createSSRApp({
+          render: () =>
+            createElementVNode(
+              'img',
+              { src: '/foo.png' },
+              null,
+              PatchFlags.PROPS,
+              ['src'],
+            ),
+        }).mount(container)
+        expect(setSrc).not.toHaveBeenCalled()
+        expect(el.getAttribute('src')).toBe('/foo.png')
+      } finally {
+        __DEV__ = true
+      }
+    })
+
+    test('still patches resource props when server and client values differ', () => {
+      __DEV__ = false
+      try {
+        const { container } = mountWithHydration(
+          `<img src="/server.png">`,
+          () =>
+            createElementVNode(
+              'img',
+              { src: '/client.png' },
+              null,
+              PatchFlags.PROPS,
+              ['src'],
+            ),
+        )
+        const el = container.firstChild as HTMLImageElement
+        expect(el.getAttribute('src')).toBe('/client.png')
+      } finally {
+        __DEV__ = true
+      }
+    })
+
+    test('force patch svg dynamic props with correct namespace when hydrating', () => {
+      __DEV__ = false
+      try {
+        const { container } = mountWithHydration(
+          `<svg width="24" height="24" viewBox="0 0 24 24"></svg>`,
+          () =>
+            createElementVNode(
+              'svg',
+              { width: 48, height: 48, viewBox: '0 0 48 48' },
+              null,
+              PatchFlags.PROPS,
+              ['width', 'height', 'viewBox'],
+            ),
+        )
+        const el = container.firstChild as Element
+        expect(el.namespaceURI).toContain('svg')
+        expect(el.getAttribute('width')).toBe('48')
+        expect(el.getAttribute('height')).toBe('48')
+        expect(el.getAttribute('viewBox')).toBe('0 0 48 48')
+      } finally {
+        __DEV__ = true
+      }
+    })
+
+    test('force patch foreignObject dynamic props with correct namespace when hydrating', () => {
+      __DEV__ = false
+      try {
+        const container = document.createElement('div')
+        container.innerHTML =
+          '<svg><foreignObject width="24"></foreignObject></svg>'
+        const el = container.querySelector('foreignObject')!
+        expect(el.namespaceURI).toContain('svg')
+        // jsdom doesn't implement SVGForeignObjectElement.width.
+        Object.defineProperty(el, 'width', {
+          configurable: true,
+          get: () => 24,
+        })
+
+        createSSRApp({
+          render: () => (
+            openBlock(),
+            createElementBlock('svg', null, [
+              (openBlock(),
+              createElementBlock(
+                'foreignObject',
+                { width: 48 },
+                null,
+                PatchFlags.PROPS,
+                ['width'],
+              )),
+            ])
+          ),
+        }).mount(container)
+
+        expect(el.getAttribute('width')).toBe('48')
+      } finally {
+        __DEV__ = true
+      }
+    })
+
+    test('only patches declared dynamic props when hydrating', () => {
+      const { container } = mountWithHydration(
+        `<div data-allow-mismatch="attribute" id="server" value="server"></div>`,
+        () =>
+          createVNode(
+            'div',
+            {
+              'data-allow-mismatch': 'attribute',
+              id: 'client',
+              value: 'client',
+            },
+            null,
+            PatchFlags.PROPS,
+            ['id'],
+          ),
+      )
+      const el = container.firstChild as Element
+
+      expect(el.getAttribute('id')).toBe('client')
+      expect(el.getAttribute('value')).toBe('server')
+    })
+  })
+
+  test('stop observing nested display: contents roots after hydration', async () => {
+    const observe = vi.fn()
+    const disconnect = vi.fn()
+    const mounted = vi.fn()
+    const originalIntersectionObserver = globalThis.IntersectionObserver
+    globalThis.IntersectionObserver = class {
+      observe = observe
+      disconnect = disconnect
+    } as any
+
+    const AsyncComp = defineAsyncComponent({
+      loader: () =>
+        Promise.resolve({
+          template: `
+            <div style="display: contents">
+              <span id="offscreen">offscreen</span>
+              <div style="display: contents">
+                <button id="visible">visible</button>
+                <span>later sibling</span>
+              </div>
+            </div>
+            <div>later fragment root</div>
+          `,
+          setup() {
+            onMounted(mounted)
+          },
+        }),
+      hydrate: hydrateOnVisible(),
+    })
+    const container = document.createElement('div')
+    const app = createSSRApp(AsyncComp)
+    try {
+      container.innerHTML = await renderToString(h(AsyncComp))
+      document.body.appendChild(container)
+      vi.spyOn(
+        container.querySelector('#visible')!,
+        'getBoundingClientRect',
+      ).mockReturnValue(new DOMRect(10, 10, 20, 20))
+      app.mount(container)
+
+      expect(mounted).toHaveBeenCalledTimes(1)
+      expect(disconnect).toHaveBeenCalledTimes(1)
+      expect(observe).toHaveBeenCalledTimes(1)
+      expect(observe).toHaveBeenCalledWith(
+        container.querySelector('#offscreen'),
+      )
+    } finally {
+      app.unmount()
+      container.remove()
+      globalThis.IntersectionObserver = originalIntersectionObserver
+    }
+  })
+
+  test('Suspense: an update waiting on an async root waits out a newer pending branch', async () => {
+    const { container, page, msg, release } = await hydrateSuspenseApp(gate => {
+      const msg = ref('a')
+      const page = ref('owner')
+
+      const Never = defineComponent({
+        async setup() {
+          await new Promise(() => {})
+          return () => h('b', 'never')
+        },
+      })
+      // with the new message, the child mounts another async component
+      const AsyncChild = defineComponent({
+        props: ['msg'],
+        async setup(props) {
+          await gate('child')
+          return () =>
+            props.msg === 'b' ? h('div', [h(Never)]) : h('span', props.msg)
+        },
+      })
+      const Slow = defineComponent({
+        async setup() {
+          await gate('slow')
+          return () => h('i', 'slow')
+        },
+      })
+      const Owner = defineComponent({
+        setup: () => () => h(AsyncChild, { msg: msg.value }),
+      })
+      const Next = defineComponent({
+        async setup() {
+          await gate('next')
+          return () => h('p', 'next')
+        },
+      })
+
+      const App = defineComponent({
+        setup: () => () =>
+          h(Suspense, null, () =>
+            page.value === 'owner' ? h('div', [h(Owner), h(Slow)]) : h(Next),
+          ),
+      })
+      return { App, page, msg }
+    })
+
+    // Owner updates before its async root has hydrated
+    msg.value = 'b'
+    await nextTick()
+    // the root resolves while the boundary still waits for Slow
+    release('child')
+    await new Promise(r => setTimeout(r))
+
+    // switching away before hydration finishes starts a newer pending branch
+    page.value = 'next'
+    await nextTick()
+    await new Promise(r => setTimeout(r))
+
+    release('next')
+    await new Promise(r => setTimeout(r))
+    expect(container.innerHTML).toBe('<p>next</p>')
+  })
+
+  test('Suspense: hydrates a component whose async setup rejects again', async () => {
+    const errorHandler = vi.fn()
+    const Bad = {
+      async setup() {
+        throw new Error('setup failed')
+      },
+      render: () => h('span', 'should not render'),
+    }
+    const container = document.createElement('div')
+    // what the server renders for the failed component
+    container.innerHTML = '<div><!----></div>'
+    const app = createSSRApp({
+      setup: () => () => h(Suspense, null, { default: h('div', [h(Bad)]) }),
+    })
+    app.config.errorHandler = errorHandler
+    app.mount(container)
+
+    await new Promise(r => setTimeout(r))
+    expect(errorHandler).toHaveBeenCalledTimes(1)
+    expect(container.innerHTML).toBe('<div><!----></div>')
+  })
+})
