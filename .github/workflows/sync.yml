@@ -1,0 +1,71 @@
+# Replaces this repository's files with a snapshot of upstream, keeping only
+# our own .github/. A snapshot instead of a merge: history pushed with
+# GITHUB_TOKEN may not touch .github/workflows/, and upstream edits its
+# workflows often. Dropping upstream's workflows also keeps its CI from running
+# here.
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Branch to write. A missing branch is created from main.
+        default: main
+      ref:
+        description: Upstream commit. Defaults to the upstream default branch.
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-${{ inputs.branch || 'main' }}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      BRANCH: ${{ inputs.branch || 'main' }}
+      REF: ${{ inputs.ref }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+
+      - name: Copy the upstream snapshot
+        run: |
+          set -euo pipefail
+          upstream=$(cat .github/testbed/upstream)
+          if [ "$BRANCH" != main ]; then
+            if git fetch --depth 1 origin "refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" 2>/dev/null; then
+              git checkout -B "$BRANCH" "origin/$BRANCH"
+            else
+              git checkout -b "$BRANCH"
+            fi
+          fi
+
+          src="$RUNNER_TEMP/upstream"
+          git init -q "$src"
+          git -C "$src" remote add origin "https://github.com/$upstream.git"
+          git -C "$src" fetch -q --depth 1 origin "${REF:-HEAD}"
+          git -C "$src" checkout -q FETCH_HEAD
+          sha=$(git -C "$src" rev-parse HEAD)
+
+          if [ "$(cat .github/testbed/upstream-sha 2>/dev/null)" = "$sha" ]; then
+            echo "Already at $upstream@$sha" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          rsync -a --delete --exclude=/.git --exclude=/.github "$src/" ./
+          echo "$sha" > .github/testbed/upstream-sha
+          git add -A
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -q -m "Sync $upstream@$sha"
+          git push origin "HEAD:refs/heads/$BRANCH"
+          echo "Synced $BRANCH to $upstream@$sha" >> "$GITHUB_STEP_SUMMARY"

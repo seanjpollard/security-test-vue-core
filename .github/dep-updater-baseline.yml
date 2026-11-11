@@ -1,0 +1,6 @@
+# The frozen baseline branch. Its own prefix keeps its branches apart from main's.
+version: 1
+updates:
+  enabled: false
+pr:
+  branch_prefix: deps-baseline/

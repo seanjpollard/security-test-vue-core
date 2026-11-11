@@ -1,0 +1,125 @@
+# Runs the updater from seanjpollard/security for security fixes only, on the
+# synced main branch and on the frozen baseline branch, then checks every PR it
+# has open and compares what it found with osv-scanner.
+name: Security updates
+
+on:
+  schedule:
+    - cron: "0 6,18 * * *"
+  workflow_dispatch:
+    inputs:
+      updater_ref:
+        description: Branch, tag, or commit of seanjpollard/security to test.
+        default: main
+
+permissions:
+  contents: read
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - base: main
+            config: .github/dep-updater.yml
+          - base: baseline
+            config: .github/dep-updater-baseline.yml
+    concurrency:
+      group: security-${{ matrix.base }} # Two runs at once would race on the same branches.
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      UPDATER: ${{ github.workspace }}/../updater-src
+      UV_NO_BUILD: "1" # Never run a package's build code to read its metadata.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.base }}
+          persist-credentials: false
+
+      # Outside the workspace, so the updater never sees it as part of the tree.
+      - name: Fetch the updater
+        env:
+          DEPLOY_KEY: ${{ secrets.UPDATER_DEPLOY_KEY }}
+          UPDATER_REF: ${{ inputs.updater_ref || 'main' }}
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/updater-key"
+          install -m 600 /dev/null "$key"
+          printf '%s\n' "$DEPLOY_KEY" > "$key"
+          echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > "$RUNNER_TEMP/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o UserKnownHostsFile=$RUNNER_TEMP/known_hosts -o StrictHostKeyChecking=yes"
+          git init -q "$UPDATER"
+          git -C "$UPDATER" remote add origin git@github.com:seanjpollard/security.git
+          git -C "$UPDATER" fetch -q --depth 1 origin "$UPDATER_REF"
+          git -C "$UPDATER" checkout -q FETCH_HEAD
+          rm -f "$key"
+          echo "Updater: seanjpollard/security@$(git -C "$UPDATER" rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ../updater-src/updater/go.mod
+          cache-dependency-path: ../updater-src/updater/go.sum
+
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+        with:
+          install: false
+
+      # The project's own pnpm and Node, the uv the plugin is tested against,
+      # and the scanners the images and mise plugins and the checks use.
+      - name: Install tools
+        run: |
+          set -euo pipefail
+          tools=("uv@$(sed -n 's/^uv = "\(.*\)"/\1/p' "$UPDATER/updater/mise.toml")"
+                 osv-scanner@2.7.0 trivy@0.76.2)
+          node=24
+          for f in .node-version .nvmrc; do
+            if [ -f "$f" ]; then node=$(head -n1 "$f" | tr -d '[:space:]' | sed 's/^v//'); break; fi
+          done
+          case "$node" in lts*) node=lts ;; esac
+          tools+=("node@$node")
+          if [ -f package.json ]; then
+            pnpm=$(jq -r '.packageManager // "" | select(startswith("pnpm@")) | ltrimstr("pnpm@") | split("+")[0]' package.json)
+            tools+=("pnpm@${pnpm:-latest}")
+          fi
+          mise use -g "${tools[@]}"
+          mise bin-paths >> "$GITHUB_PATH"
+          mise ls --current
+
+      - name: Run the updater
+        id: updater
+        env:
+          DEP_UPDATER_TOKEN: ${{ github.token }}
+          DEP_UPDATER_BASE: ${{ matrix.base }}
+          CONFIG: ${{ matrix.config }}
+        run: |
+          go build -C "$UPDATER/updater" -trimpath -o "$RUNNER_TEMP/dep-updater" .
+          "$RUNNER_TEMP/dep-updater" -root "$GITHUB_WORKSPACE" -config "$CONFIG" -plugins "$UPDATER/updater/plugins"
+
+      # The only step after the updater that sees a token.
+      - name: Fetch the open PRs
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE: ${{ matrix.base }}
+        run: |
+          set -euo pipefail
+          gh pr list --repo "$GITHUB_REPOSITORY" --base "$BASE" --state open --limit 200 \
+            --json number,headRefName,headRefOid,body,url > "$RUNNER_TEMP/prs.json"
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          for branch in $(jq -r '.[] | select(.body | contains("<!-- dep-updater ")) | .headRefName' "$RUNNER_TEMP/prs.json"); do
+            git -c http.https://github.com/.extraheader="AUTHORIZATION: basic $auth" \
+              fetch -q --depth 2 origin "refs/heads/$branch:refs/remotes/origin/$branch"
+          done
+
+      - name: Check each PR
+        if: ${{ !cancelled() }}
+        run: python3 -I "$UPDATER/updater/testbed/check.py" prs --prs "$RUNNER_TEMP/prs.json" --work "$RUNNER_TEMP/prs"
+
+      - name: Compare with osv-scanner
+        if: ${{ !cancelled() }}
+        run: python3 -I "$UPDATER/updater/testbed/check.py" compare --prs "$RUNNER_TEMP/prs.json"
