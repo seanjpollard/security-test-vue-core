@@ -28,3 +28,6 @@ peerDependencyRules:
     '@typescript-eslint/parser>eslint': '^9.0.0'
     '@typescript-eslint/type-utils>eslint': '^9.0.0'
     '@typescript-eslint/utils>eslint': '^9.0.0'
+overrides:
+  'minimatch@10.2.6': '11.0.1' # lockwright: GHSA-g3hv-75wg-m249
+  'minimatch@3.1.5': '11.0.1' # lockwright: GHSA-g3hv-75wg-m249
