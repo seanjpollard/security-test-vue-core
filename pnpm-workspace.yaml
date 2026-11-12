@@ -28,3 +28,5 @@ peerDependencyRules:
     '@typescript-eslint/parser>eslint': '^9.0.0'
     '@typescript-eslint/type-utils>eslint': '^9.0.0'
     '@typescript-eslint/utils>eslint': '^9.0.0'
+overrides:
+  'picomatch@2.3.2': '4.0.4' # lockwright: GHSA-3v7f-55p6-f55p, GHSA-c2c7-rcm5-vvqj
