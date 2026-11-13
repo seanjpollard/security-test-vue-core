@@ -38,3 +38,5 @@ minimumReleaseAgeExclude:
   - vitest@4.1.11
   # Renovate security update: minimatch@11.0.1
   - minimatch@11.0.1
+overrides:
+  'zod@3.25.76': '4.6.6' # lockwright: GHSA-mrhx-c7xc-m3w5
