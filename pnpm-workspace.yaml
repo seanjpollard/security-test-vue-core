@@ -38,3 +38,6 @@ minimumReleaseAgeExclude:
   - vitest@4.1.11
   # Renovate security update: minimatch@11.0.1
   - minimatch@11.0.1
+overrides:
+  'minimatch@10.2.6': '11.0.1' # lockwright: GHSA-g3hv-75wg-m249
+  'minimatch@3.1.5': '11.0.1' # lockwright: GHSA-g3hv-75wg-m249
