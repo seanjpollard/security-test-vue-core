@@ -28,3 +28,5 @@ peerDependencyRules:
     '@typescript-eslint/parser>eslint': '^9.0.0'
     '@typescript-eslint/type-utils>eslint': '^9.0.0'
     '@typescript-eslint/utils>eslint': '^9.0.0'
+overrides:
+  'basic-ftp@5.3.1': '6.2.4' # lockwright: GHSA-5pm8-86m8-9m6r, GHSA-5rq4-664w-9x2c, GHSA-6v7q-wjvx-w8wg, GHSA-c475-qrg2-pj4r, GHSA-r4jh-29pc-gfqr, GHSA-rp42-5vxx-qpwr, GHSA-rpmf-866q-6p89
