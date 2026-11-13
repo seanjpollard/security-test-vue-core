@@ -38,3 +38,5 @@ minimumReleaseAgeExclude:
   - vitest@4.1.11
   # Renovate security update: minimatch@11.0.1
   - minimatch@11.0.1
+overrides:
+  'brace-expansion@1.1.22': '5.0.12' # lockwright: GHSA-3jxr-9vmj-r5cp, GHSA-6j4f-fj2g-mc7p, GHSA-f886-m6hf-6m8v, GHSA-jxxr-4gwj-5jf2, GHSA-mh99-v99m-4gvg, GHSA-q2hr-2g5m-vwhr, GHSA-qhr7-859c-m2p7, GHSA-rgw5-rvv9-x895
