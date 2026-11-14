@@ -38,3 +38,6 @@ minimumReleaseAgeExclude:
   - vitest@4.1.11
   # Renovate security update: minimatch@11.0.1
   - minimatch@11.0.1
+overrides:
+  '@vitest/mocker@4.1.11': '4.1.12' # lockwright: GHSA-qxg6-89mg-rqv8, GHSA-xp26-3454-mjgp
+  'compression@1.8.1': '1.8.2' # lockwright: GHSA-vc2v-76pw-4v95
